@@ -81,6 +81,11 @@ return view.extend({
         }
         o.description = proxyDesc;
 
+        o = s.option(form.Value, 'proxy_link', _('前置代理节点链接'));
+        o.placeholder = 'vless://uuid@server:port?security=tls&sni=example.com#node_name';
+        o.description = _('支持直接粘贴 vless://、vmess://、trojan://、hysteria2://、tuic://、socks5:// 格式的单节点链接，系统将自动解析并回填下方的参数。');
+        o.depends('proxy_enabled', '1');
+
         o = s.option(form.ListValue, 'proxy_type', _('前置代理类型'));
         o.value('socks5', 'SOCKS5');
         o.value('http', 'HTTP');
@@ -184,6 +189,131 @@ return view.extend({
         o.default = '8118';
         o.depends('http_enabled', '1');
 
-        return m.render();
+        return m.render().then(L.bind(function(viewEl) {
+            var linkInput = viewEl.querySelector('[name="cbid.warp.config.proxy_link"]');
+            if (linkInput) {
+                linkInput.addEventListener('input', function(ev) {
+                    var val = ev.target.value.trim();
+                    if (!val) return;
+                    
+                    var scheme = '';
+                    if (val.indexOf('://') !== -1) {
+                        scheme = val.split('://')[0].toLowerCase();
+                    } else {
+                        return;
+                    }
+                    
+                    var type = '', addr = '', port = '', uuid = '', password = '', tls = '0', sni = '', flow = '', security = 'auto';
+                    
+                    if (scheme === 'vmess') {
+                        var b64 = val.substring(8);
+                        try {
+                            var hashIdx = b64.indexOf('#');
+                            if (hashIdx !== -1) b64 = b64.substring(0, hashIdx);
+                            var jsonStr = atob(b64);
+                            var obj = JSON.parse(jsonStr);
+                            type = 'vmess';
+                            addr = obj.add || '';
+                            port = obj.port || '';
+                            uuid = obj.id || '';
+                            security = obj.scy || 'auto';
+                            tls = (obj.tls === 'tls') ? '1' : '0';
+                            sni = obj.sni || obj.host || '';
+                        } catch(e) {}
+                    } else if (['vless', 'trojan', 'hysteria2', 'tuic', 'socks5', 'http'].indexOf(scheme) !== -1) {
+                        type = scheme;
+                        if (scheme === 'socks5') type = 'socks5';
+                        
+                        var remaining = val.substring(scheme.length + 3);
+                        var hashIdx = remaining.indexOf('#');
+                        if (hashIdx !== -1) remaining = remaining.substring(0, hashIdx);
+                        
+                        var queryStr = '';
+                        var queryIdx = remaining.indexOf('?');
+                        if (queryIdx !== -1) {
+                            queryStr = remaining.substring(queryIdx + 1);
+                            remaining = remaining.substring(0, queryIdx);
+                        }
+                        
+                        var userInfo = '';
+                        var hostPort = remaining;
+                        var atIdx = remaining.indexOf('@');
+                        if (atIdx !== -1) {
+                            userInfo = remaining.substring(0, atIdx);
+                            hostPort = remaining.substring(atIdx + 1);
+                        }
+                        
+                        if (hostPort.indexOf('[') !== -1) {
+                            var closeBracket = hostPort.indexOf(']');
+                            addr = hostPort.substring(1, closeBracket);
+                            var lastColon = hostPort.lastIndexOf(':');
+                            if (lastColon > closeBracket) {
+                                port = hostPort.substring(lastColon + 1);
+                            }
+                        } else {
+                            var colonIdx = hostPort.lastIndexOf(':');
+                            if (colonIdx !== -1) {
+                                addr = hostPort.substring(0, colonIdx);
+                                port = hostPort.substring(colonIdx + 1);
+                            } else {
+                                addr = hostPort;
+                            }
+                        }
+                        
+                        if (userInfo) {
+                            if (scheme === 'tuic') {
+                                var parts = userInfo.split(':');
+                                uuid = parts[0] || '';
+                                password = parts[1] || '';
+                            } else if (scheme === 'vless') {
+                                uuid = userInfo;
+                            } else {
+                                password = userInfo;
+                            }
+                        }
+                        
+                        if (queryStr) {
+                            var queryParams = {};
+                            var pairs = queryStr.split('&');
+                            for (var i = 0; i < pairs.length; i++) {
+                                var p = pairs[i].split('=');
+                                if (p.length === 2) {
+                                    queryParams[p[0].toLowerCase()] = decodeURIComponent(p[1]);
+                                }
+                            }
+                            sni = queryParams['sni'] || queryParams['peer'] || queryParams['host'] || '';
+                            flow = queryParams['flow'] || '';
+                            var sec = queryParams['security'] || '';
+                            tls = (sec === 'tls' || queryParams['tls'] === '1') ? '1' : '0';
+                        }
+                        
+                        if (scheme === 'hysteria2' || scheme === 'tuic') {
+                            tls = '1';
+                        }
+                    }
+                    
+                    var setVal = function(optName, optVal) {
+                        var input = viewEl.querySelector('[name="cbid.warp.config.' + optName + '"]');
+                        if (input) {
+                            input.value = optVal;
+                            input.dispatchEvent(new Event('change'));
+                        }
+                    };
+                    
+                    if (type) {
+                        setVal('proxy_type', type);
+                        setVal('proxy_addr', addr);
+                        setVal('proxy_port', port);
+                        setVal('proxy_uuid', uuid);
+                        setVal('proxy_password', password);
+                        setVal('proxy_tls', tls);
+                        setVal('proxy_sni', sni);
+                        setVal('proxy_vless_flow', flow);
+                        setVal('proxy_vmess_security', security);
+                    }
+                });
+            }
+            return viewEl;
+        }, this));
     }
 });
