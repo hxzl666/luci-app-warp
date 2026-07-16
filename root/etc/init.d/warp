@@ -1,12 +1,11 @@
 #!/bin/sh /etc/rc.common
-# Cloudflare WARP service for OpenWrt using cloudflare-warp.
+# Cloudflare WARP 启动服务，改用 sing-box (WireGuard) 作为底层核心
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 START=99
 STOP=10
 USE_PROCD=1
 
-WARP_BIN="/usr/bin/warp"
 IPT2SOCKS_BIN="/usr/bin/ipt2socks"
 NFT_TABLE="luci_warp"
 TPROXY_MARK="0x2333"
@@ -14,11 +13,51 @@ TPROXY_TABLE="100"
 CHINA_SET="china_ips"
 LOG_FILE="/var/log/warp.log"
 IPT2SOCKS_PID="/var/run/warp-ipt2socks.pid"
+DATA_DIR="/etc/warp"
+SINGBOX_CONF="$DATA_DIR/sing-box.json"
 
 warp_log() {
 	mkdir -p /var/log 2>/dev/null || true
 	printf '%s warp: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
 	logger -t warp "$*" 2>/dev/null || true
+}
+
+# 寻找可用的 sing-box 二进制文件
+find_singbox() {
+	if command -v sing-box >/dev/null 2>&1; then
+		command -v sing-box
+		return 0
+	fi
+	for path in "/usr/bin/sing-box" "/usr/sbin/sing-box" "/usr/local/bin/sing-box" "/usr/share/singbox/sing-box"; do
+		if [ -x "$path" ]; then
+			echo "$path"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 检测 sing-box 是否为 1.11/1.12+ 新版本 (新版本使用 endpoints 节点承载 WireGuard)
+is_new_singbox() {
+	local bin="$1"
+	[ -x "$bin" ] || return 1
+	
+	local ver_str=$("$bin" version 2>/dev/null | head -n1 | awk '{print $3}')
+	[ -z "$ver_str" ] && ver_str=$("$bin" version 2>/dev/null | grep -i "version" | awk '{print $3}')
+	[ -z "$ver_str" ] && return 1 # 默认作为老版本处理
+	
+	local main_ver=$(echo "$ver_str" | cut -d. -f1 | tr -cd '0-9')
+	local sub_ver=$(echo "$ver_str" | cut -d. -f2 | tr -cd '0-9')
+	
+	[ -z "$main_ver" ] && main_ver=0
+	[ -z "$sub_ver" ] && sub_ver=0
+	
+	if [ "$main_ver" -gt 1 ]; then
+		return 0
+	elif [ "$main_ver" -eq 1 ] && [ "$sub_ver" -ge 11 ]; then
+		return 0
+	fi
+	return 1
 }
 
 load_china_ipset() {
@@ -43,24 +82,24 @@ setup_tproxy() {
 	tproxy_port="$2"
 	bypass_china="$3"
 
-	# 1. Start ipt2socks
+	# 1. 启动 ipt2socks
 	if [ ! -x "$IPT2SOCKS_BIN" ]; then
 		warp_log "Error: ipt2socks not found at $IPT2SOCKS_BIN"
 		return 1
 	fi
 
-	# TPROXY for both TCP and UDP
+	# TPROXY 同时接管 TCP 和 UDP
 	"$IPT2SOCKS_BIN" -s 127.0.0.1 -p "$socks_port" \
 		-b 0.0.0.0 -l "$tproxy_port" \
 		-4 -j 2 -n 65535 </dev/null >>"$LOG_FILE" 2>&1 &
 	echo $! > "$IPT2SOCKS_PID"
 	warp_log "Started ipt2socks on port $tproxy_port"
 
-	# 2. IP rules and routes
+	# 2. 配置 IP 路由规则与本地回环路由
 	ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 	ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 
-	# 3. nftables rules
+	# 3. 设置 nftables 规则
 	if ! command -v nft >/dev/null 2>&1; then
 		warp_log "Error: nft command not found, cannot setup TPROXY"
 		return 1
@@ -71,12 +110,12 @@ setup_tproxy() {
 	nft add chain inet "$NFT_TABLE" prerouting '{ type filter hook prerouting priority mangle; policy accept; }'
 	nft add chain inet "$NFT_TABLE" output '{ type filter hook output priority mangle; policy accept; }'
 
-	# Skip local traffic
+	# 绕过本地回环流量
 	nft add rule inet "$NFT_TABLE" prerouting ip saddr 127.0.0.0/8 return
-	# Skip private IPs
+	# 绕过局域网/内网私有 IP 流量
 	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4 }' return
 
-	# China IP bypass
+	# 绕过中国大陆 IP
 	if [ "$bypass_china" = "1" ]; then
 		if load_china_ipset; then
 			nft add rule inet "$NFT_TABLE" prerouting ip daddr @"$CHINA_SET" return
@@ -86,7 +125,7 @@ setup_tproxy() {
 		fi
 	fi
 
-	# TCP and UDP TPROXY
+	# TCP 和 UDP TPROXY 规则下发
 	if lsmod | grep -q 'nft_tproxy'; then
 		nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
 		nft add rule inet "$NFT_TABLE" prerouting meta l4proto udp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
@@ -108,7 +147,7 @@ teardown_tproxy() {
 		kill "$(cat "$IPT2SOCKS_PID")" >/dev/null 2>&1 || true
 		rm -f "$IPT2SOCKS_PID"
 	fi
-	# Backup kill
+	# 强杀残留进程
 	killall -9 ipt2socks >/dev/null 2>&1 || true
 }
 
@@ -117,12 +156,14 @@ start_service() {
 	config_get ENABLED config enabled 0
 	[ "$ENABLED" = "1" ] || return 0
 
-	if [ ! -x "$WARP_BIN" ]; then
-		warp_log "Missing warp binary at $WARP_BIN"
+	# 1. 查找并验证 sing-box
+	SINGBOX_BIN=$(find_singbox)
+	if [ -z "$SINGBOX_BIN" ]; then
+		warp_log "Missing sing-box binary, service cannot be started."
 		return 1
 	fi
 
-	config_get DATA_DIR config data_dir "/etc/warp"
+	# 2. 读取配置参数
 	config_get SOCKS_ENABLED config socks_enabled "1"
 	config_get SOCKS_PORT config socks_port "1080"
 	config_get HTTP_ENABLED config http_enabled "0"
@@ -131,44 +172,213 @@ start_service() {
 	config_get GLOBAL_PROXY config global_proxy "0"
 	config_get BYPASS_CHINA config bypass_china "0"
 	config_get TPROXY_PORT config tproxy_port "12345"
+	
+	# 前置代理配置
+	config_get PROXY_ENABLED config proxy_enabled "0"
+	config_get PROXY_TYPE config proxy_type "socks5"
+	config_get PROXY_ADDR config proxy_addr "127.0.0.1"
+	config_get PROXY_PORT config proxy_port "1081"
+	
+	# 凭据配置
+	config_get PRIVATE_KEY config private_key ""
+	config_get ADDRESS_V6 config address_v6 ""
+	config_get RESERVED config reserved ""
 
-	if [ ! -f "$DATA_DIR/reg.json" ]; then
-		warp_log "No account found. Run 'warp-manager register' first."
+	# 3. 校验账号状态
+	if [ -z "$PRIVATE_KEY" ] || [ -z "$ADDRESS_V6" ]; then
+		warp_log "No registered WARP account configs found. Please run 'warp-manager register' first."
 		return 1
 	fi
 
-	procd_open_instance "warp"
-	procd_set_param command "$WARP_BIN" run
-	procd_append_param command --data-dir "$DATA_DIR"
-
-	[ "$SOCKS_ENABLED" = "1" ] && \
-		procd_append_param command --socks-addr "0.0.0.0:$SOCKS_PORT"
-	[ "$HTTP_ENABLED" = "1" ] && \
-		procd_append_param command --http-addr "0.0.0.0:$HTTP_PORT"
-
-	# 检查端点是否合法（WireGuard 内核要求必须是 IP）
-	# 如果端点包含域名（例如旧版的 masque.cloudflareclient.com），则强制使用默认 IP
-	DEFAULT_IP="162.159.193.1:2408"
-	if [ -z "$ENDPOINT" ] || echo "$ENDPOINT" | grep -q "[a-zA-Z]"; then
-		[ -n "$ENDPOINT" ] && warp_log "Endpoint '$ENDPOINT' is invalid (domain not supported), falling back to $DEFAULT_IP"
-		ENDPOINT="$DEFAULT_IP"
+	# 4. 自动安装 jq 以支持安全增量合并
+	if ! command -v jq >/dev/null 2>&1; then
+		warp_log "Installing jq dependency for config manipulation..."
+		opkg update && opkg install jq >/dev/null 2>&1
 	fi
-	procd_append_param command -e "$ENDPOINT"
 
+	if ! command -v jq >/dev/null 2>&1; then
+		warp_log "Error: jq is required but could not be installed."
+		return 1
+	fi
+
+	# 5. 初始化空白配置文件（如不存在）
+	mkdir -p "$DATA_DIR"
+	if [ ! -f "$SINGBOX_CONF" ]; then
+		echo '{"log":{"level":"info"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct-out"}],"route":{"rules":[]}}' > "$SINGBOX_CONF"
+	fi
+
+	# 6. 解析优选 endpoint
+	# WireGuard 的 endpoint IP 不能为域名
+	DEFAULT_IP="162.159.193.1"
+	DEFAULT_PORT="2408"
+	EP_IP="$DEFAULT_IP"
+	EP_PORT="$DEFAULT_PORT"
+	
+	if [ -n "$ENDPOINT" ]; then
+		if echo "$ENDPOINT" | grep -q "[a-zA-Z]"; then
+			warp_log "Endpoint '$ENDPOINT' has domain. Resolving domain to IP is not supported natively by sing-box, falling back to default $DEFAULT_IP:$DEFAULT_PORT"
+		else
+			EP_IP=$(echo "$ENDPOINT" | cut -d: -f1)
+			EP_PORT=$(echo "$ENDPOINT" | cut -d: -f2)
+			[ -z "$EP_PORT" ] && EP_PORT="$DEFAULT_PORT"
+		fi
+	fi
+
+	# 7. 拼接 JSON 格式配置
+	# 构造前置代理 outbound
+	PROXY_OUT_JSON="null"
+	if [ "$PROXY_ENABLED" = "1" ]; then
+		if [ "$PROXY_TYPE" = "socks5" ]; then
+			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "socks", "tag": "proxy-out", "server": $addr, "server_port": $port}')
+		else
+			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "http", "tag": "proxy-out", "server": $addr, "server_port": $port}')
+		fi
+	fi
+
+	# 提取 reserved 数组
+	RESERVED_ARR="null"
+	if echo "$RESERVED" | grep -q "^\[.*\]$"; then
+		RESERVED_ARR="$RESERVED"
+	fi
+
+	# 8. 区分 sing-box 版本生成对应的 WireGuard 块并合并
+	if is_new_singbox "$SINGBOX_BIN"; then
+		warp_log "sing-box version is modern (>= 1.11). Generating configuration with endpoints node."
+		
+		# 构造 1.11+ 的 endpoints 块
+		WG_ENDPOINT_JSON=$(jq -n \
+			--arg ip "$EP_IP" \
+			--argjson port "$EP_PORT" \
+			--arg pk "$PRIVATE_KEY" \
+			--arg v6 "$ADDRESS_V6" \
+			--argjson reserved "$RESERVED_ARR" \
+			--arg proxy_enabled "$PROXY_ENABLED" \
+			'
+			{
+			  "type": "wireguard",
+			  "tag": "warp-out",
+			  "address": ["172.16.0.2/32", ($v6 + "/128")],
+			  "private_key": $pk,
+			  "peers": [
+				{
+				  "address": $ip,
+				  "port": $port,
+				  "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+				  "allowed_ips": ["0.0.0.0/0"]
+				}
+			  ]
+			} | 
+			if $reserved != null then . + {"reserved": $reserved} else . end |
+			if $proxy_enabled == "1" then . + {"detour": "proxy-out"} else . end
+			'
+		)
+
+		# 新版本增量写入 endpoints
+		jq \
+			--argjson socks_in "$([ "$SOCKS_ENABLED" = "1" ] && echo "true" || echo "false")" \
+			--argjson socks_port "$SOCKS_PORT" \
+			--argjson http_in "$([ "$HTTP_ENABLED" = "1" ] && echo "true" || echo "false")" \
+			--argjson http_port "$HTTP_PORT" \
+			--argjson proxy_out "$PROXY_OUT_JSON" \
+			--argjson wg_ep "$WG_ENDPOINT_JSON" \
+			'
+			if .inbounds == null then .inbounds = [] else . end |
+			if .outbounds == null then .outbounds = [] else . end |
+			if .endpoints == null then .endpoints = [] else . end |
+			if .route == null then .route = {"rules": []} else . end |
+			if .route.rules == null then .route.rules = [] else . end |
+
+			.inbounds |= map(select(.tag != "socks-in" and .tag != "http-in")) |
+			if $socks_in then .inbounds += [{"type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": $socks_port}] else . end |
+			if $http_in then .inbounds += [{"type": "http", "tag": "http-in", "listen": "0.0.0.0", "listen_port": $http_port}] else . end |
+
+			.outbounds |= map(select(.tag != "warp-out" and .tag != "proxy-out")) |
+			if $proxy_out != null then .outbounds += [$proxy_out] else . end |
+			if (.outbounds | any(.tag == "direct-out") | not) then .outbounds += [{"type": "direct", "tag": "direct-out"}] else . end |
+
+			.endpoints |= map(select(.tag != "warp-out")) |
+			.endpoints += [$wg_ep] |
+
+			.route.rules |= map(select(.inbound | index("socks-in") or index("http-in") | not)) |
+			.route.rules += [{"inbound": ["socks-in", "http-in"], "outbound": "warp-out"}]
+			' \
+			"$SINGBOX_CONF" > /tmp/warp-singbox.tmp && mv /tmp/warp-singbox.tmp "$SINGBOX_CONF"
+			
+	else
+		warp_log "sing-box version is legacy (< 1.11). Generating configuration with outbounds node."
+		
+		# 构造 1.11 以前的 outbounds 块
+		WG_OUTBOUND_JSON=$(jq -n \
+			--arg ip "$EP_IP" \
+			--argjson port "$EP_PORT" \
+			--arg pk "$PRIVATE_KEY" \
+			--arg v6 "$ADDRESS_V6" \
+			--argjson reserved "$RESERVED_ARR" \
+			--arg proxy_enabled "$PROXY_ENABLED" \
+			'
+			{
+			  "type": "wireguard",
+			  "tag": "warp-out",
+			  "server": $ip,
+			  "server_port": $port,
+			  "local_address": ["172.16.0.2/32", ($v6 + "/128")],
+			  "private_key": $pk,
+			  "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+			} | 
+			if $reserved != null then . + {"reserved": $reserved} else . end |
+			if $proxy_enabled == "1" then . + {"detour": "proxy-out"} else . end
+			'
+		)
+
+		# 老版本增量写入 outbounds，清除 endpoints 的残留
+		jq \
+			--argjson socks_in "$([ "$SOCKS_ENABLED" = "1" ] && echo "true" || echo "false")" \
+			--argjson socks_port "$SOCKS_PORT" \
+			--argjson http_in "$([ "$HTTP_ENABLED" = "1" ] && echo "true" || echo "false")" \
+			--argjson http_port "$HTTP_PORT" \
+			--argjson proxy_out "$PROXY_OUT_JSON" \
+			--argjson wg_out "$WG_OUTBOUND_JSON" \
+			'
+			if .inbounds == null then .inbounds = [] else . end |
+			if .outbounds == null then .outbounds = [] else . end |
+			if .route == null then .route = {"rules": []} else . end |
+			if .route.rules == null then .route.rules = [] else . end |
+
+			.inbounds |= map(select(.tag != "socks-in" and .tag != "http-in")) |
+			if $socks_in then .inbounds += [{"type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": $socks_port}] else . end |
+			if $http_in then .inbounds += [{"type": "http", "tag": "http-in", "listen": "0.0.0.0", "listen_port": $http_port}] else . end |
+
+			.outbounds |= map(select(.tag != "warp-out" and .tag != "proxy-out")) |
+			.outbounds += [$wg_out] |
+			if $proxy_out != null then .outbounds += [$proxy_out] else . end |
+			if (.outbounds | any(.tag == "direct-out") | not) then .outbounds += [{"type": "direct", "tag": "direct-out"}] else . end |
+
+			if .endpoints != null then .endpoints |= map(select(.tag != "warp-out")) else . end |
+
+			.route.rules |= map(select(.inbound | index("socks-in") or index("http-in") | not)) |
+			.route.rules += [{"inbound": ["socks-in", "http-in"], "outbound": "warp-out"}]
+			' \
+			"$SINGBOX_CONF" > /tmp/warp-singbox.tmp && mv /tmp/warp-singbox.tmp "$SINGBOX_CONF"
+	fi
+
+	# 9. 通过 procd 启动 sing-box 服务
+	procd_open_instance "warp"
+	procd_set_param command "$SINGBOX_BIN" run -c "$SINGBOX_CONF"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param term_timeout 5
 	procd_close_instance
 
-	warp_log "Started warp proxy"
+	warp_log "Started sing-box warp proxy"
 
+	# 10. 处理全局透明代理接管 (TPROXY)
 	if [ "$GLOBAL_PROXY" = "1" ]; then
 		if [ "$SOCKS_ENABLED" = "1" ]; then
-			# Delay to allow warp to start before proxying traffic
+			# 延迟启动透明拦截，确保 sing-box 端口就绪
 			(sleep 3; setup_tproxy "$SOCKS_PORT" "$TPROXY_PORT" "$BYPASS_CHINA") &
 		else
-			warp_log "Warning: Global proxy requires SOCKS5 proxy to be enabled."
+			warp_log "Warning: Global proxy mode requires SOCKS5 proxy to be enabled."
 		fi
 	fi
 }

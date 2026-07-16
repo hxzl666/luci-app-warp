@@ -4,7 +4,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-warp
-PKG_VERSION:=1.4.4
+PKG_VERSION:=0.0.1
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=hxzlplp7
@@ -17,15 +17,15 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Cloudflare WARP
-  DEPENDS:=+luci-base +jsonfilter +ca-bundle
+  DEPENDS:=+luci-base +jsonfilter +ca-bundle +jq
   PKGARCH:=all
 endef
 
 define Package/$(PKG_NAME)/description
-  LuCI interface for managing Cloudflare WARP via cloudflare-warp (WireGuard protocol).
+  LuCI interface for managing Cloudflare WARP via sing-box (WireGuard protocol).
   Features include auto registration, TPROXY global proxy, China IP bypass, IP endpoint scanning,
   SOCKS5 and HTTP proxy support.
-  Requires cloudflare-warp and ipt2socks binaries.
+  Requires sing-box and ipt2socks binaries.
 endef
 
 define Package/$(PKG_NAME)/conffiles
@@ -81,7 +81,16 @@ define Package/$(PKG_NAME)/postinst
 	/etc/init.d/warp enable 2>/dev/null
 	rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 	(/etc/init.d/rpcd restart >/dev/null 2>&1; /etc/init.d/uhttpd restart >/dev/null 2>&1) &
-	[ -x /usr/bin/warp ] || echo "luci-app-warp: /usr/bin/warp is required; run install.sh or install cloudflare-warp manually." >&2
+	
+	found_sb=""
+	if command -v sing-box >/dev/null 2>&1; then
+		found_sb="yes"
+	else
+		for path in "/usr/bin/sing-box" "/usr/sbin/sing-box" "/usr/local/bin/sing-box" "/usr/share/singbox/sing-box"; do
+			[ -x "$path" ] && found_sb="yes" && break
+		done
+	fi
+	[ -n "$$found_sb" ] || echo "luci-app-warp: sing-box is required; run install.sh or install sing-box manually." >&2
 }
 exit 0
 endef

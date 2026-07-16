@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-shot installer for luci-app-warp with cloudflare-warp and ipt2socks.
+# Cloudflare WARP 核心一键安装脚本，改用 sing-box (WireGuard)
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -eu
@@ -50,6 +50,28 @@ check_system() {
 	ok "detected ${DISTRIB_DESCRIPTION:-OpenWrt}"
 }
 
+# 查找已安装的 sing-box
+find_singbox() {
+	if command -v sing-box >/dev/null 2>&1; then
+		command -v sing-box
+		return 0
+	fi
+	for path in "/usr/bin/sing-box" "/usr/sbin/sing-box" "/usr/local/bin/sing-box" "/usr/share/singbox/sing-box"; do
+		if [ -x "$path" ]; then
+			echo "$path"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 检查 PassWall 状态以用于后续说明
+check_passwall() {
+	if [ -f "/etc/config/passwall" ] || [ -f "/etc/config/passwall_dev" ]; then
+		ok "Detected PassWall installation. You can configure warp to use PassWall local SOCKS5 port (e.g. 1081) as parent proxy later."
+	fi
+}
+
 install_opkg_packages() {
 	log "installing OpenWrt packages"
 	if ! opkg update; then
@@ -89,53 +111,38 @@ install_opkg_package() {
 	die "failed to install required package: $pkg"
 }
 
-get_asset_arch() {
-	case "$(uname -m)" in
-		x86_64)
-			printf '%s\n' "amd64"
-			;;
-		aarch64|arm64)
-			printf '%s\n' "arm64"
-			;;
-		armv7*|armv7l)
-			printf '%s\n' "armv7"
-			;;
-		armv6*|armv6l)
-			printf '%s\n' "armv6"
-			;;
-		armv5*|armv5l)
-			printf '%s\n' "armv5"
-			;;
-		mips|mipsel)
-			printf '%s\n' "mipsle"
-			;;
-		*)
-			return 1
-			;;
-	esac
-}
+# 安装 sing-box 及其所需的依赖
+install_dependencies() {
+	# 1. 自动安装 jq 以合并配置
+	log "Installing jq dependency..."
+	install_opkg_package jq || warn "jq was not installed; please install it manually via opkg"
 
-install_warp_binaries() {
-	if command -v warp >/dev/null 2>&1 && command -v ipt2socks >/dev/null 2>&1; then
-		ok "warp and ipt2socks are already installed"
-		return
+	# 2. 检测并复用 sing-box
+	if find_singbox >/dev/null; then
+		ok "sing-box binary is already installed at $(find_singbox). Reusing existing core."
+	else
+		log "sing-box not found. Trying to install via opkg..."
+		if ! install_opkg_package sing-box optional; then
+			if ! install_opkg_package sing-box-non-geoip optional; then
+				warn "Failed to install sing-box via opkg. You must install/download sing-box binary manually."
+			else
+				ok "sing-box-non-geoip successfully installed."
+			fi
+		else
+			ok "sing-box successfully installed."
+		fi
 	fi
 
-	asset_arch="$(get_asset_arch)" || die "unsupported architecture $(uname -m); please build warp and ipt2socks manually and place them in /usr/bin/"
-	
-	log "Note: Pre-compiled binaries for cloudflare-warp may not be available on GitHub releases yet."
-	warn "You may need to cross-compile cloudflare-warp and ipt2socks manually and place them in /usr/bin/"
-	
-	if [ ! -f "/usr/bin/warp" ]; then
-		warn "warp binary not found at /usr/bin/warp."
+	# 3. 检测并安装 ipt2socks
+	if command -v ipt2socks >/dev/null 2>&1 || [ -x "/usr/bin/ipt2socks" ]; then
+		ok "ipt2socks is already installed"
 	else
-		ok "warp binary found."
-	fi
-
-	if [ ! -f "/usr/bin/ipt2socks" ]; then
-		warn "ipt2socks binary not found at /usr/bin/ipt2socks."
-	else
-		ok "ipt2socks binary found."
+		log "ipt2socks not found. Trying to install via opkg..."
+		if ! install_opkg_package ipt2socks optional; then
+			warn "Failed to install ipt2socks via opkg. You may need to compile/download ipt2socks manually."
+		else
+			ok "ipt2socks successfully installed."
+		fi
 	fi
 }
 
@@ -200,7 +207,8 @@ register_account() {
 main() {
 	check_system
 	install_opkg_packages
-	install_warp_binaries
+	install_dependencies
+	check_passwall
 	install_app
 	register_account
 

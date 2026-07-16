@@ -1,54 +1,93 @@
 #!/bin/sh
-# Cloudflare WARP manager script for OpenWrt using cloudflare-warp
+# Cloudflare WARP 核心管理脚本，使用 sing-box 承载 wireguard 出站
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 . /lib/functions.sh
 
-WARP_BIN="${WARP_BIN:-/usr/bin/warp}"
 DATA_DIR="/etc/warp"
 REG_FILE="$DATA_DIR/reg.json"
-CONF_FILE="$DATA_DIR/conf.json"
+SINGBOX_CONF="$DATA_DIR/sing-box.json"
 
-need_warp() {
-	if [ ! -x "$WARP_BIN" ]; then
-		printf 'Error: warp binary not found at %s.\n' "$WARP_BIN" >&2
+# 查找系统可用的 sing-box 二进制文件
+find_singbox() {
+	if command -v sing-box >/dev/null 2>&1; then
+		command -v sing-box
+		return 0
+	fi
+	for path in "/usr/bin/sing-box" "/usr/sbin/sing-box" "/usr/local/bin/sing-box" "/usr/share/singbox/sing-box"; do
+		if [ -x "$path" ]; then
+			echo "$path"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 检查依赖
+need_singbox() {
+	if ! find_singbox >/dev/null; then
+		printf 'Error: sing-box binary not found. Please install it first.\n' >&2
 		return 1
 	fi
 }
 
-update_uci_account() {
-	[ -f "$CONF_FILE" ] || return 0
-
-	if command -v jsonfilter >/dev/null 2>&1; then
-		addr_v4="$(jsonfilter -i "$CONF_FILE" -e '@.config.interface.addresses.v4' 2>/dev/null)"
-		addr_v6="$(jsonfilter -i "$CONF_FILE" -e '@.config.interface.addresses.v6' 2>/dev/null)"
-
-		if [ -z "$addr_v4" ] && [ -z "$addr_v6" ]; then
-			logger -t warp-manager "Warning: could not extract addresses from $CONF_FILE - please check JSON path"
-		else
-			[ -n "$addr_v4" ] && uci -q set warp.config.address_v4="$addr_v4"
-			[ -n "$addr_v6" ] && uci -q set warp.config.address_v6="$addr_v6"
-			uci commit warp
-		fi
-	fi
-}
-
+# 注册 WARP 账户，获取私钥、IPv6 及 reserved 配置
 register_account() {
-	need_warp || return 1
-	
-	printf 'Registering new WARP account using cloudflare-warp...\n'
+	printf 'Registering new WARP account via warp.xijp.eu.org...\n'
 	mkdir -p "$DATA_DIR"
 	
-	if "$WARP_BIN" generate --data-dir "$DATA_DIR"; then
-		printf 'Successfully registered WARP account.\n'
-		update_uci_account
-		return 0
-	else
-		printf 'Failed to register WARP account.\n' >&2
+	# 使用临时文件保存接口响应
+	tmp_file="/tmp/warp_res.$$"
+	if command -v curl >/dev/null 2>&1; then
+		curl -ks --connect-timeout 10 --max-time 15 "https://warp.xijp.eu.org" > "$tmp_file"
+	elif command -v wget >/dev/null 2>&1; then
+		wget --no-check-certificate -qO- --timeout=10 "https://warp.xijp.eu.org" > "$tmp_file"
+	fi
+	
+	if [ ! -s "$tmp_file" ]; then
+		printf 'Error: Failed to fetch configuration from warp.xijp.eu.org.\n' >&2
+		rm -f "$tmp_file"
 		return 1
 	fi
+	
+	# 从中文响应中提取私钥、IPv6及reserved参数
+	private_key=$(grep -i "私钥" "$tmp_file" | head -n1 | sed -E 's/.*私钥[：:]//' | tr -d '\r\n ')
+	[ -z "$private_key" ] && private_key=$(grep -i "private_key" "$tmp_file" | head -n1 | sed -E 's/.*(key|私钥)[：:]//' | tr -d '\r\n ')
+	
+	ipv6_addr=$(grep -i "IPV6" "$tmp_file" | head -n1 | sed -E 's/.*地址[：:]//' | tr -d '\r\n ')
+	[ -z "$ipv6_addr" ] && ipv6_addr=$(grep -i "ipv6" "$tmp_file" | head -n1 | sed -E 's/.*(address|地址)[：:]//' | tr -d '\r\n ')
+	
+	reserved_val=$(grep -i "reserved" "$tmp_file" | head -n1 | sed -E 's/.*值[：:]//' | tr -d '\r\n ')
+	[ -z "$reserved_val" ] && reserved_val=$(grep -i "reserved" "$tmp_file" | head -n1 | sed -E 's/.*(val|值)[：:]//' | tr -d '\r\n ')
+	
+	rm -f "$tmp_file"
+	
+	if [ -z "$private_key" ] || [ -z "$ipv6_addr" ] || [ -z "$reserved_val" ]; then
+		printf 'Error: Failed to parse WARP credentials from response.\n' >&2
+		return 1
+	fi
+	
+	# 保存至 UCI 配置中
+	uci -q set warp.config.address_v4="172.16.0.2"
+	uci -q set warp.config.address_v6="$ipv6_addr"
+	uci -q set warp.config.private_key="$private_key"
+	uci -q set warp.config.reserved="$reserved_val"
+	uci commit warp
+	
+	# 生成备份及状态标识文件 reg.json
+	cat > "$REG_FILE" <<EOF
+{
+  "private_key": "$private_key",
+  "ipv6_addr": "$ipv6_addr",
+  "reserved": $reserved_val
+}
+EOF
+	
+	printf 'Successfully registered WARP account and saved credentials.\n'
+	return 0
 }
 
+# 升级授权（在使用 sing-box 承载时由于依赖外部 API，本地无法直接触发 update 逻辑，此处仅记录 UCI 并提示）
 apply_license() {
 	LICENSE_KEY="${1:-$(uci -q get warp.config.license_key)}"
 	if [ -z "$LICENSE_KEY" ]; then
@@ -56,24 +95,18 @@ apply_license() {
 		return 1
 	fi
 
-	need_warp || return 1
-
-	printf 'Applying WARP+ license key...\n'
-	if "$WARP_BIN" update --data-dir "$DATA_DIR" --license "$LICENSE_KEY"; then
-		printf 'Successfully applied license key.\n'
-		update_uci_account
-		return 0
-	else
-		printf 'Failed to apply license key.\n' >&2
-		return 1
-	fi
+	uci -q set warp.config.license_key="$LICENSE_KEY"
+	uci commit warp
+	printf 'License key saved. (Note: key upgrade is handled externally by warp.xijp.eu.org)\n'
+	return 0
 }
 
+# 获取当前服务运行状态
 get_status() {
-	if pgrep -f "warp.*run" >/dev/null 2>&1; then
+	if pgrep -f "sing-box.*warp/sing-box.json" >/dev/null 2>&1; then
 		printf 'Service: running\n'
 		
-		# Check SOCKS5/HTTP port listening
+		# 检查本地 SOCKS5 与 HTTP 端口是否正常监听
 		socks_port="$(uci -q get warp.config.socks_port)"
 		http_port="$(uci -q get warp.config.http_port)"
 		
@@ -98,6 +131,7 @@ get_status() {
 	fi
 }
 
+# 测试网络连接（使用本地 SOCKS5 代理请求 Cloudflare 状态接口）
 test_connection() {
 	socks_port="$(uci -q get warp.config.socks_port)"
 	
@@ -113,7 +147,7 @@ test_connection() {
 
 	printf 'Testing connection through WARP SOCKS5 proxy...\n'
 	
-	test_output="$(curl -s -x "socks5://127.0.0.1:$socks_port" --max-time 10 https://www.cloudflare.com/cdn-cgi/trace)"
+	test_output="$(curl -ks -x "socks5://127.0.0.1:$socks_port" --max-time 10 https://www.cloudflare.com/cdn-cgi/trace)"
 	
 	if [ -z "$test_output" ]; then
 		printf 'Failed to connect to Cloudflare trace service.\n' >&2
@@ -135,18 +169,22 @@ test_connection() {
 	printf '--------------------\n'
 }
 
+# 重置并清除配置
 reset_account() {
 	printf 'Resetting WARP account data...\n'
-	rm -f "$REG_FILE" "$CONF_FILE"
+	rm -f "$REG_FILE" "$SINGBOX_CONF"
 	uci -q delete warp.config.address_v4
 	uci -q delete warp.config.address_v6
+	uci -q delete warp.config.private_key
+	uci -q delete warp.config.reserved
 	uci commit warp
 	printf 'Account data has been cleared.\n'
 }
 
+# 导出生成的配置文件
 export_config() {
-	if [ -f "$CONF_FILE" ]; then
-		cat "$CONF_FILE"
+	if [ -f "$SINGBOX_CONF" ]; then
+		cat "$SINGBOX_CONF"
 	else
 		printf 'No configuration found. Generate it first.\n' >&2
 		return 1

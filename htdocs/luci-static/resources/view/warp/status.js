@@ -141,23 +141,33 @@ return view.extend({
 
             if (action === 'test') {
                 var output = res.stdout || '';
-                var warpStatus = output.match(/(?:warp=|WARP:\s*)([^\n]+)/i);
-                var ip = output.match(/(?:ip=|IP:\s*)([^\n]+)/i);
-                var loc = output.match(/(?:loc=|Location:\s*)([^\n]+)/i);
+                var warpStatus = output.match(/(?:warp=|WARP\s+Status:\s*)([^\n\r]+)/i);
+                var ip = output.match(/(?:ip=|Exit\s+IP:\s*)([^\n\r]+)/i);
+                var loc = output.match(/(?:loc=|Location:\s*)([^\n\r]+)/i);
+
+                var cleanVal = function(match) {
+                    if (!match) return null;
+                    // 清理 ANSI 终端着色代码并去除两端空白
+                    return match[1].replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
+                };
+
+                var statusStr = cleanVal(warpStatus);
+                var ipStr = cleanVal(ip);
+                var locStr = cleanVal(loc);
 
                 ui.showModal(_('连接测试结果'), [
                     E('div', { 'class': 'cbi-section' }, [
                         E('p', {}, [
                             E('strong', {}, 'WARP 状态: '),
-                            warpStatus ? warpStatus[1] : _('未知')
+                            statusStr ? statusStr : _('未知')
                         ]),
                         E('p', {}, [
                             E('strong', {}, '出口 IP: '),
-                            ip ? ip[1] : _('未知')
+                            ipStr ? ipStr : _('未知')
                         ]),
                         E('p', {}, [
                             E('strong', {}, '位置: '),
-                            loc ? loc[1] : _('未知')
+                            locStr ? locStr : _('未知')
                         ])
                     ]),
                     E('div', { 'class': 'right' }, [
