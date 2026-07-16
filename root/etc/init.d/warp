@@ -178,6 +178,12 @@ start_service() {
 	config_get PROXY_TYPE config proxy_type "socks5"
 	config_get PROXY_ADDR config proxy_addr "127.0.0.1"
 	config_get PROXY_PORT config proxy_port "1081"
+	config_get PROXY_UUID config proxy_uuid ""
+	config_get PROXY_PASSWORD config proxy_password ""
+	config_get PROXY_TLS config proxy_tls "0"
+	config_get PROXY_SNI config proxy_sni ""
+	config_get PROXY_VLESS_FLOW config proxy_vless_flow ""
+	config_get PROXY_VMESS_SECURITY config proxy_vmess_security "auto"
 	
 	# 凭据配置
 	config_get PRIVATE_KEY config private_key ""
@@ -230,8 +236,108 @@ start_service() {
 	if [ "$PROXY_ENABLED" = "1" ]; then
 		if [ "$PROXY_TYPE" = "socks5" ]; then
 			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "socks", "tag": "proxy-out", "server": $addr, "server_port": $port}')
-		else
+		elif [ "$PROXY_TYPE" = "http" ]; then
 			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "http", "tag": "proxy-out", "server": $addr, "server_port": $port}')
+		elif [ "$PROXY_TYPE" = "trojan" ]; then
+			PROXY_OUT_JSON=$(jq -n \
+				--arg addr "$PROXY_ADDR" \
+				--argjson port "$PROXY_PORT" \
+				--arg pwd "$PROXY_PASSWORD" \
+				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
+				--arg sni "$PROXY_SNI" \
+				'
+				{
+				  "type": "trojan",
+				  "tag": "proxy-out",
+				  "server": $addr,
+				  "server_port": $port,
+				  "password": $pwd
+				} |
+				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
+				'
+			)
+		elif [ "$PROXY_TYPE" = "vless" ]; then
+			PROXY_OUT_JSON=$(jq -n \
+				--arg addr "$PROXY_ADDR" \
+				--argjson port "$PROXY_PORT" \
+				--arg uuid "$PROXY_UUID" \
+				--arg flow "$PROXY_VLESS_FLOW" \
+				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
+				--arg sni "$PROXY_SNI" \
+				'
+				{
+				  "type": "vless",
+				  "tag": "proxy-out",
+				  "server": $addr,
+				  "server_port": $port,
+				  "uuid": $uuid
+				} |
+				if $flow != "" then . + {"flow": $flow} else . end |
+				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
+				'
+			)
+		elif [ "$PROXY_TYPE" = "vmess" ]; then
+			PROXY_OUT_JSON=$(jq -n \
+				--arg addr "$PROXY_ADDR" \
+				--argjson port "$PROXY_PORT" \
+				--arg uuid "$PROXY_UUID" \
+				--arg sec "$PROXY_VMESS_SECURITY" \
+				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
+				--arg sni "$PROXY_SNI" \
+				'
+				{
+				  "type": "vmess",
+				  "tag": "proxy-out",
+				  "server": $addr,
+				  "server_port": $port,
+				  "uuid": $uuid,
+				  "security": $sec
+				} |
+				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
+				'
+			)
+		elif [ "$PROXY_TYPE" = "hysteria2" ]; then
+			PROXY_OUT_JSON=$(jq -n \
+				--arg addr "$PROXY_ADDR" \
+				--argjson port "$PROXY_PORT" \
+				--arg pwd "$PROXY_PASSWORD" \
+				--arg sni "$PROXY_SNI" \
+				'
+				{
+				  "type": "hysteria2",
+				  "tag": "proxy-out",
+				  "server": $addr,
+				  "server_port": $port,
+				  "password": $pwd,
+				  "tls": {
+				    "enabled": true,
+				    "server_name": $sni
+				  }
+				}
+				'
+			)
+		elif [ "$PROXY_TYPE" = "tuic" ]; then
+			PROXY_OUT_JSON=$(jq -n \
+				--arg addr "$PROXY_ADDR" \
+				--argjson port "$PROXY_PORT" \
+				--arg uuid "$PROXY_UUID" \
+				--arg pwd "$PROXY_PASSWORD" \
+				--arg sni "$PROXY_SNI" \
+				'
+				{
+				  "type": "tuic",
+				  "tag": "proxy-out",
+				  "server": $addr,
+				  "server_port": $port,
+				  "uuid": $uuid,
+				  "password": $pwd,
+				  "tls": {
+				    "enabled": true,
+				    "server_name": $sni
+				  }
+				}
+				'
+			)
 		fi
 	fi
 

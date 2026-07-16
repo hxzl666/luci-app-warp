@@ -84,17 +84,66 @@ return view.extend({
         o = s.option(form.ListValue, 'proxy_type', _('前置代理类型'));
         o.value('socks5', 'SOCKS5');
         o.value('http', 'HTTP');
+        o.value('vless', 'VLESS');
+        o.value('vmess', 'VMess');
+        o.value('trojan', 'Trojan');
+        o.value('hysteria2', 'Hysteria 2');
+        o.value('tuic', 'TUIC v5');
         o.default = 'socks5';
         o.depends('proxy_enabled', '1');
 
         o = s.option(form.Value, 'proxy_addr', _('前置代理地址'));
         o.default = '127.0.0.1';
+        o.rmempty = false;
         o.depends('proxy_enabled', '1');
 
         o = s.option(form.Value, 'proxy_port', _('前置代理端口'));
         o.datatype = 'port';
         o.default = '1081';
+        o.rmempty = false;
         o.depends('proxy_enabled', '1');
+
+        o = s.option(form.Value, 'proxy_uuid', _('UUID / 用户ID'));
+        o.password = true;
+        o.rmempty = true;
+        o.depends('proxy_type', 'vless');
+        o.depends('proxy_type', 'vmess');
+        o.depends('proxy_type', 'tuic');
+
+        o = s.option(form.Value, 'proxy_password', _('密码'));
+        o.password = true;
+        o.rmempty = true;
+        o.depends('proxy_type', 'trojan');
+        o.depends('proxy_type', 'hysteria2');
+        o.depends('proxy_type', 'tuic');
+
+        o = s.option(form.Flag, 'proxy_tls', _('启用 TLS'));
+        o.default = '0';
+        o.depends('proxy_type', 'vless');
+        o.depends('proxy_type', 'vmess');
+        o.depends('proxy_type', 'trojan');
+
+        o = s.option(form.Value, 'proxy_sni', _('SNI / Server Name'));
+        o.placeholder = 'example.com';
+        o.rmempty = true;
+        o.depends('proxy_tls', '1');
+        o.depends('proxy_type', 'hysteria2');
+        o.depends('proxy_type', 'tuic');
+
+        o = s.option(form.ListValue, 'proxy_vless_flow', _('VLESS 流控 (Flow)'));
+        o.value('', _('无 (None)'));
+        o.value('xtls-rprx-vision', 'xtls-rprx-vision');
+        o.default = '';
+        o.depends('proxy_type', 'vless');
+
+        o = s.option(form.ListValue, 'proxy_vmess_security', _('VMess 加密方式'));
+        o.value('auto', 'auto');
+        o.value('none', 'none');
+        o.value('zero', 'zero');
+        o.value('aes-128-gcm', 'aes-128-gcm');
+        o.value('chacha20-poly1305', 'chacha20-poly1305');
+        o.default = 'auto';
+        o.depends('proxy_type', 'vmess');
 
         // 代理与接管设置
         s = m.section(form.NamedSection, 'config', 'warp', _('全局透明代理'));

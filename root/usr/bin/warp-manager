@@ -53,12 +53,18 @@ register_account() {
 	# 从中文响应中提取私钥、IPv6及reserved参数
 	private_key=$(grep -i "私钥" "$tmp_file" | head -n1 | sed -E 's/.*私钥[：:]//' | tr -d '\r\n ')
 	[ -z "$private_key" ] && private_key=$(grep -i "private_key" "$tmp_file" | head -n1 | sed -E 's/.*(key|私钥)[：:]//' | tr -d '\r\n ')
+	# 强行滤除任何 UTF-8 BOM 或控制台着色字符等杂质
+	private_key=$(echo "$private_key" | tr -cd 'a-zA-Z0-9+/=')
 	
 	ipv6_addr=$(grep -i "IPV6" "$tmp_file" | head -n1 | sed -E 's/.*地址[：:]//' | tr -d '\r\n ')
 	[ -z "$ipv6_addr" ] && ipv6_addr=$(grep -i "ipv6" "$tmp_file" | head -n1 | sed -E 's/.*(address|地址)[：:]//' | tr -d '\r\n ')
+	# 强行滤除 IPv6 地址中的非打印字符和乱码字符
+	ipv6_addr=$(echo "$ipv6_addr" | tr -cd '0-9a-fA-F:')
 	
 	reserved_val=$(grep -i "reserved" "$tmp_file" | head -n1 | sed -E 's/.*值[：:]//' | tr -d '\r\n ')
 	[ -z "$reserved_val" ] && reserved_val=$(grep -i "reserved" "$tmp_file" | head -n1 | sed -E 's/.*(val|值)[：:]//' | tr -d '\r\n ')
+	# 强行滤除 reserved 数组字符中的乱码
+	reserved_val=$(echo "$reserved_val" | tr -cd '0-9,[]')
 	
 	rm -f "$tmp_file"
 	
