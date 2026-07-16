@@ -374,7 +374,7 @@ start_service() {
 				}
 			  ]
 			} | 
-			if $reserved != null then . + {"reserved": $reserved} else . end |
+			if $reserved != null then .peers[0] += {"reserved": $reserved} else . end |
 			if $proxy_enabled == "1" then . + {"detour": "proxy-out"} else . end
 			'
 		)
