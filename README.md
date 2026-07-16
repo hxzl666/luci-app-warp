@@ -25,6 +25,15 @@ OpenWrt 平台的 Cloudflare WARP LuCI 管理界面，改用 `sing-box` (WireGua
 - `ca-bundle`
 - `kmod-nft-tproxy` (开启全局透明代理需要)
 
+## 🛠️ 本地打包
+
+如果您是在 Windows 或其它非 OpenWrt 编译环境下开发，可以使用项目根目录下的 `build_ipk.py` 辅助脚本，直接在本地生成符合 Unix 权限标准的安装包：
+
+```bash
+python build_ipk.py
+```
+这会在当前目录下输出 `luci-app-warp_0.0.1_all.ipk`。您可直接将此安装包上传至 OpenWrt 路由器执行 `opkg install` 进行安装。
+
 ## 🚀 安装指南
 
 ### 方法一：一键安装脚本
