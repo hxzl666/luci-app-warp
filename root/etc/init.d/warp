@@ -68,6 +68,7 @@ setup_tproxy() {
 	local socks_port="$1"
 	local tproxy_port="$2"
 	local bypass_china="$3"
+	local ipv6_enabled="$4"
 
 	# 1. 启动 ipt2socks (TCP TPROXY → SOCKS5)
 	if [ ! -x "$IPT2SOCKS_BIN" ]; then
@@ -78,16 +79,32 @@ setup_tproxy() {
 
 	killall -9 ipt2socks 2>/dev/null || true
 
-	# -4 = IPv4 only, -j = concurrency
+	# IPv4: ipt2socks on tproxy_port
 	"$IPT2SOCKS_BIN" -s 127.0.0.1 -p "$socks_port" \
 		-b 0.0.0.0 -l "$tproxy_port" \
 		-4 -j 2 </dev/null >>"$LOG_FILE" 2>&1 &
 	echo $! > "$IPT2SOCKS_PID"
-	warp_log "Started ipt2socks on port $tproxy_port → SOCKS5 $socks_port"
+	warp_log "Started ipt2socks (IPv4) on port $tproxy_port → SOCKS5 $socks_port"
 
-	# 2. 配置 IP 路由规则与本地回环路由 (IPv4 only)
+	# IPv6: 第二个 ipt2socks 实例 (如果启用)
+	local tproxy_port6=$((tproxy_port + 1))
+	if [ "$ipv6_enabled" = "1" ]; then
+		"$IPT2SOCKS_BIN" -s 127.0.0.1 -p "$socks_port" \
+			-b :: -l "$tproxy_port6" \
+			-6 -j 2 </dev/null >>"$LOG_FILE" 2>&1 &
+		echo $! > "${IPT2SOCKS_PID}.6"
+		warp_log "Started ipt2socks (IPv6) on port $tproxy_port6 → SOCKS5 $socks_port"
+	fi
+
+	# 2. 配置 IP 路由规则与本地回环路由
+	# IPv4
 	ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 	ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+	# IPv6
+	if [ "$ipv6_enabled" = "1" ]; then
+		ip -6 rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+		ip -6 route add local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+	fi
 
 	# 3. 设置 nftables 规则
 	if ! command -v nft >/dev/null 2>&1; then
@@ -101,10 +118,13 @@ setup_tproxy() {
 	nft add chain inet "$NFT_TABLE" output '{ type filter hook output priority mangle; policy accept; }'
 
 	# ── prerouting 链 ──
-	# 绕过本地回环流量
+	# 绕过本地回环流量 (IPv4 + IPv6)
 	nft add rule inet "$NFT_TABLE" prerouting ip saddr 127.0.0.0/8 return
-	# 绕过局域网/内网私有 IP 流量
 	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4 }' return
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" prerouting ip6 saddr ::1/128 return
+		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }' return
+	fi
 
 	# 绕过中国大陆 IP (直连不走代理)
 	if [ "$bypass_china" = "1" ]; then
@@ -116,8 +136,11 @@ setup_tproxy() {
 		fi
 	fi
 
-	# 绕过 WARP 自身流量 (防止循环)
+	# 绕过 WARP 自身流量 (防止循环) — IPv4 + IPv6
 	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' return
+	fi
 
 	# 绕过用户自定义 IP (bypass_ips + openclash_bypass_ips)
 	local bypass_ips_str
@@ -128,20 +151,36 @@ setup_tproxy() {
 	oc_bypass_str="$(uci -q get warp.config.openclash_bypass_ips 2>/dev/null)"
 	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $oc_bypass_str }" return 2>/dev/null && warp_log "OpenClash bypass IPs (prerouting): $oc_bypass_str"
 
-	# TCP TPROXY 规则 (只拦 IPv4 TCP)
-	nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
-	warp_log "Setup nftables TPROXY for IPv4 TCP only"
+	# TCP TPROXY 规则 — IPv4
+	nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp ip protocol tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
+	warp_log "Setup nftables TPROXY for IPv4 TCP"
+
+	# TCP TPROXY 规则 — IPv6
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp ip6 nexthdr tcp tproxy to :"$tproxy_port6" meta mark set "$TPROXY_MARK"
+		warp_log "Setup nftables TPROXY for IPv6 TCP"
+	fi
 
 	# ── output 链 (本机产生的流量) ──
-	# 私有 IP + 回环 bypass
+	# 私有 IP + 回环 bypass (IPv4 + IPv6)
 	nft add rule inet "$NFT_TABLE" output ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' return
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ ::1/128, fc00::/7, fe80::/10 }' return
+	fi
 	# WARP MASQUE 端点 bypass
 	nft add rule inet "$NFT_TABLE" output ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' return
+	fi
 	# 用户自定义 bypass_ips (output 链也生效,防止本机流量劫持 frp/anytls 隧道)
 	[ -n "$bypass_ips_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $bypass_ips_str }" return 2>/dev/null
 	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $oc_bypass_str }" return 2>/dev/null
 	# 标记本机 IPv4 TCP 流量走 TPROXY
-	nft add rule inet "$NFT_TABLE" output meta l4proto tcp meta mark set "$TPROXY_MARK"
+	nft add rule inet "$NFT_TABLE" output meta l4proto tcp ip protocol tcp meta mark set "$TPROXY_MARK"
+	# 标记本机 IPv6 TCP 流量走 TPROXY
+	if [ "$ipv6_enabled" = "1" ]; then
+		nft add rule inet "$NFT_TABLE" output meta l4proto tcp ip6 nexthdr tcp meta mark set "$TPROXY_MARK"
+	fi
 }
 
 teardown_tproxy() {
@@ -149,12 +188,20 @@ teardown_tproxy() {
 		nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
 	fi
 
+	# IPv4
 	ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" >/dev/null 2>&1 || true
 	ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 || true
+	# IPv6
+	ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" >/dev/null 2>&1 || true
+	ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 || true
 
 	if [ -f "$IPT2SOCKS_PID" ]; then
 		kill "$(cat "$IPT2SOCKS_PID")" >/dev/null 2>&1 || true
 		rm -f "$IPT2SOCKS_PID"
+	fi
+	if [ -f "${IPT2SOCKS_PID}.6" ]; then
+		kill "$(cat "${IPT2SOCKS_PID}.6")" >/dev/null 2>&1 || true
+		rm -f "${IPT2SOCKS_PID}.6"
 	fi
 	killall -9 ipt2socks >/dev/null 2>&1 || true
 }
@@ -428,7 +475,7 @@ start_service() {
 	if [ "$GLOBAL_PROXY" = "1" ]; then
 		if [ "$MODE" = "socks" ] || [ "$MODE" = "http-proxy" ]; then
 			# 延迟启动透明拦截,确保 usque 端口就绪
-			(sleep 3; setup_tproxy "$SOCKS_PORT" "$TPROXY_PORT" "$BYPASS_CHINA"; setup_dns_proxy "$SOCKS_PORT" "$IPV6") &
+			(sleep 3; setup_tproxy "$SOCKS_PORT" "$TPROXY_PORT" "$BYPASS_CHINA" "$IPV6"; setup_dns_proxy "$SOCKS_PORT" "$IPV6") &
 			warp_log "Global TPROXY + DNS leak protection enabled ($MODE mode)"
 		elif [ "$MODE" = "nativetun" ]; then
 			warp_log "nativetun mode: TPROXY not needed (usque creates TUN device)"
@@ -452,6 +499,8 @@ reload_service() {
 	nft delete table inet luci_warp >/dev/null 2>&1 || true
 	ip rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
 	ip route del local 0.0.0.0/0 dev lo table 100 >/dev/null 2>&1 || true
+	ip -6 rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
+	ip -6 route del local ::/0 dev lo table 100 >/dev/null 2>&1 || true
 	# 删除备份 DNS 配置 (动态查找所有可能的 dnsmasq conf-dir)
 	for conf_dir in /tmp/dnsmasq.*/backup_dns.conf /tmp/dnsmasq.d/backup_dns.conf; do
 		[ -f "$conf_dir" ] && rm -f "$conf_dir" 2>/dev/null
