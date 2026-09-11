@@ -58,8 +58,8 @@ return view.extend({
         var socksPort = uci.get('warp', 'config', 'socks_port') || '1080';
         var httpPort = uci.get('warp', 'config', 'http_port') || '8118';
 
-        var socksRunning = netstatOutput.indexOf(':' + socksPort) !== -1;
-        var httpRunning = netstatOutput.indexOf(':' + httpPort) !== -1;
+        var socksRunning = new RegExp(':' + socksPort + '\\b').test(netstatOutput);
+        var httpRunning = new RegExp(':' + httpPort + '\\b').test(netstatOutput);
 
         var modeNames = {
             'socks': 'SOCKS5 代理',
@@ -81,7 +81,8 @@ return view.extend({
         }
 
         if (modeEl) {
-            modeEl.innerHTML = '<span class="badge info">' + modeDisplay + '</span>';
+            modeEl.textContent = '';
+            modeEl.appendChild(E('span', { 'class': 'badge info' }, modeDisplay));
         }
 
         if (accountEl) {
@@ -91,15 +92,23 @@ return view.extend({
         }
 
         if (socksEl) {
-            socksEl.innerHTML = socksRunning
-                ? '<span class="badge success">运行中 (端口 ' + socksPort + ')</span>'
-                : '<span class="badge warning">未启动</span>';
+            socksEl.textContent = '';
+            if (socksRunning) {
+                socksEl.appendChild(E('span', { 'class': 'badge success' },
+                    _('运行中') + ' (' + _('端口') + ' ' + socksPort + ')'));
+            } else {
+                socksEl.appendChild(E('span', { 'class': 'badge warning' }, _('未启动')));
+            }
         }
 
         if (httpEl) {
-            httpEl.innerHTML = httpRunning
-                ? '<span class="badge success">运行中 (端口 ' + httpPort + ')</span>'
-                : '<span class="badge warning">未启动</span>';
+            httpEl.textContent = '';
+            if (httpRunning) {
+                httpEl.appendChild(E('span', { 'class': 'badge success' },
+                    _('运行中') + ' (' + _('端口') + ' ' + httpPort + ')'));
+            } else {
+                httpEl.appendChild(E('span', { 'class': 'badge warning' }, _('未启动')));
+            }
         }
     },
 
@@ -145,7 +154,12 @@ return view.extend({
             '(/usr/bin/warp-manager ' + cmdMap[action] +
             ' > ' + logFile + ' 2>&1; echo $?) > ' + doneFile +
             ' < /dev/null > /dev/null 2>&1 &'
-        ]);
+        ]).then(function() {
+            setTimeout(pollResult, isQuick ? 500 : 1000);
+        }).catch(function(err) {
+            ui.hideModal();
+            ui.addNotification(null, E('p', {}, _('无法启动操作: ') + (err.message || err)));
+        });
 
         var attempts = 0;
         var maxAttempts = isQuick ? 10 : 40;
@@ -182,7 +196,8 @@ return view.extend({
 
                 /* Done — read exit code + log */
                 return L.resolveDefault(fs.read(doneFile), '1').then(function (exitStr) {
-                    var exitCode = parseInt(exitStr.trim(), 10) || 0;
+                    var exitCode = parseInt(exitStr.trim(), 10);
+                    if (isNaN(exitCode)) exitCode = 1;
                     return L.resolveDefault(fs.read(logFile), '').then(function (output) {
                         fs.exec('/bin/rm', ['-f', logFile, doneFile]);
 
@@ -259,8 +274,8 @@ return view.extend({
         var socksPort = uci.get('warp', 'config', 'socks_port') || '1080';
         var httpPort = uci.get('warp', 'config', 'http_port') || '8118';
 
-        var socksRunning = netstatOutput.indexOf(':' + socksPort) !== -1;
-        var httpRunning = netstatOutput.indexOf(':' + httpPort) !== -1;
+        var socksRunning = new RegExp(':' + socksPort + '\\b').test(netstatOutput);
+        var httpRunning = new RegExp(':' + httpPort + '\\b').test(netstatOutput);
 
         var modeNames = {
             'socks': 'SOCKS5 代理',
@@ -326,13 +341,13 @@ return view.extend({
                     E('div', { 'class': 'status-row' }, [
                         E('span', {}, 'SOCKS5'),
                         E('span', { 'id': 'warp-socks' },
-                            socksRunning ? E('span', { 'class': 'badge success' }, _('运行中 (端口 ') + socksPort + ')')
+                            socksRunning ? E('span', { 'class': 'badge success' }, _('运行中') + ' (' + _('端口') + ' ' + socksPort + ')')
                                 : E('span', { 'class': 'badge warning' }, _('未启动')))
                     ]),
                     E('div', { 'class': 'status-row' }, [
                         E('span', {}, 'HTTP'),
                         E('span', { 'id': 'warp-http' },
-                            httpRunning ? E('span', { 'class': 'badge success' }, _('运行中 (端口 ') + httpPort + ')')
+                            httpRunning ? E('span', { 'class': 'badge success' }, _('运行中') + ' (' + _('端口') + ' ' + httpPort + ')')
                                 : E('span', { 'class': 'badge warning' }, _('未启动')))
                     ])
                 ])

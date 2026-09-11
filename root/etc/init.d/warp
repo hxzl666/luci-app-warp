@@ -7,8 +7,8 @@ STOP=10
 USE_PROCD=1
 
 NFT_TABLE="luci_warp"
-TPROXY_MARK="0x2333"
-TPROXY_TABLE="100"
+BYPASS_MARK="0x2333"
+BYPASS_TABLE="100"
 CHINA_SET="china_ips"
 LOG_FILE="/var/log/warp.log"
 DATA_DIR="/etc/warp"
@@ -19,6 +19,19 @@ warp_log() {
 	mkdir -p /var/log /var/lock /var/run 2>/dev/null || true
 	printf '%s warp: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
 	logger -t warp "$*" 2>/dev/null || true
+}
+
+# ── 校验数字参数 ─────────────────────────────────────────────────────
+validate_num() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+# ── 校验 IP/CIDR 格式 ────────────────────────────────────────────────
+validate_ip_cidr() {
+	echo "$1" | grep -qE '^[0-9a-fA-F.:]+(/[0-9]+)?$'
 }
 
 # ── 查找 usque 二进制文件 ──────────────────────────────────────────────
@@ -41,10 +54,9 @@ load_china_ipset() {
 	china_file="/etc/warp/china_ip.txt"
 	[ -s "$china_file" ] || return 1
 
-	tmpf="/tmp/warp-nft-china.$$"
+	tmpf="$(mktemp /tmp/warp-nft-china.XXXXXX)"
 	awk '{print}' "$china_file" | grep -v '^#' | grep -v '^$' > "$tmpf" 2>/dev/null
 
-	local count
 	count=$(wc -l < "$tmpf" 2>/dev/null)
 	[ "$count" -gt 0 ] || { rm -f "$tmpf"; return 1; }
 
@@ -52,7 +64,9 @@ load_china_ipset() {
 	nft add set inet "$NFT_TABLE" "$CHINA_SET" '{ type ipv4_addr; flags interval; }' 2>/dev/null
 
 	while IFS= read -r line; do
-		[ -n "$line" ] && nft add element inet "$NFT_TABLE" "$CHINA_SET" "{ $line }" 2>/dev/null
+		line="$(echo "$line" | tr -d '[:space:]')"
+		[ -n "$line" ] && validate_ip_cidr "$line" && \
+			nft add element inet "$NFT_TABLE" "$CHINA_SET" "{ $line }" 2>/dev/null
 	done < "$tmpf"
 	rm -f "$tmpf"
 
@@ -62,21 +76,43 @@ load_china_ipset() {
 
 # ── TUN 透明代理 bypass 规则 ──────────────────────────────────────────
 # nativetun 模式: usque 创建 TUN 设备,添加默认路由 → 全部流量走 WARP
-# 这里只需用 nftables 给 bypass 流量打标记,ip rule 让标记流量走主路由表
-# 不需要 ipt2socks / dns2socks — usque TUN 直接处理
+# 这里用 nftables 给 bypass 流量打标记,ip rule 让标记流量走 bypass 路由表
+# bypass 路由表保存原始默认网关,绕过 TUN
 setup_tun_bypass() {
 	local bypass_china="$1"
 	local ipv6_enabled="$2"
 
-	# ip rule: 标记流量走主路由表 (绕过 TUN 默认路由)
-	ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
-	ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
-	if [ "$ipv6_enabled" = "1" ]; then
-		ip -6 rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
-		ip -6 route add local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+	# 1. 保存原始默认路由(非 TUN 设备),放入 bypass 表
+	local orig_route
+	orig_route="$(ip route show default 2>/dev/null | grep -vE 'dev (tun|utun|wg|warp)' | head -1)"
+	if [ -z "$orig_route" ]; then
+		# 如果主表没原始路由了,尝试找任何非 TUN 的默认路由
+		orig_route="$(ip route show default 2>/dev/null | head -1)"
 	fi
 
-	# nftables: 给 bypass 流量打标记
+	if [ -n "$orig_route" ]; then
+		# 将原始路由复制到 bypass 表
+		ip route flush table "$BYPASS_TABLE" 2>/dev/null || true
+		ip route add $orig_route table "$BYPASS_TABLE" 2>/dev/null || true
+		warp_log "Bypass table: using original route: $orig_route"
+	else
+		warp_log "Warning: could not find original default route for bypass table"
+	fi
+
+	# ip rule: 标记流量走 bypass 表 (绕过 TUN 默认路由)
+	ip rule add fwmark "$BYPASS_MARK" table "$BYPASS_TABLE" 2>/dev/null || true
+
+	if [ "$ipv6_enabled" = "1" ]; then
+		local orig_route6
+		orig_route6="$(ip -6 route show default 2>/dev/null | grep -vE 'dev (tun|utun|wg|warp)' | head -1)"
+		if [ -n "$orig_route6" ]; then
+			ip -6 route flush table "$BYPASS_TABLE" 2>/dev/null || true
+			ip -6 route add $orig_route6 table "$BYPASS_TABLE" 2>/dev/null || true
+		fi
+		ip -6 rule add fwmark "$BYPASS_MARK" table "$BYPASS_TABLE" 2>/dev/null || true
+	fi
+
+	# 2. nftables: 给 bypass 流量打标记
 	if ! command -v nft >/dev/null 2>&1; then
 		warp_log "Error: nft command not found"
 		return 1
@@ -87,23 +123,45 @@ setup_tun_bypass() {
 	nft add chain inet "$NFT_TABLE" prerouting '{ type filter hook prerouting priority mangle; policy accept; }'
 	nft add chain inet "$NFT_TABLE" output '{ type filter hook output priority mangle; policy accept; }'
 
-	# 读取用户自定义 bypass IP
+	# 读取并校验用户自定义 bypass IP
 	local bypass_ips_str oc_bypass_str
 	bypass_ips_str="$(uci -q get warp.config.bypass_ips 2>/dev/null)"
 	oc_bypass_str="$(uci -q get warp.config.openclash_bypass_ips 2>/dev/null)"
 
+	# 校验 bypass_ips 格式
+	local valid_bypass="" valid_oc=""
+	if [ -n "$bypass_ips_str" ]; then
+		for ip in $bypass_ips_str; do
+			if validate_ip_cidr "$ip"; then
+				valid_bypass="${valid_bypass:+$valid_bypass }$ip"
+			else
+				warp_log "Warning: invalid bypass IP '$ip', skipped"
+			fi
+		done
+	fi
+	if [ -n "$oc_bypass_str" ]; then
+		for ip in $oc_bypass_str; do
+			if validate_ip_cidr "$ip"; then
+				valid_oc="${valid_oc:+$valid_oc }$ip"
+			else
+				warp_log "Warning: invalid OpenClash bypass IP '$ip', skipped"
+			fi
+		done
+	fi
+
 	# ── prerouting 链 (局域网设备产生的流量) ──
-	nft add rule inet "$NFT_TABLE" prerouting ip saddr 127.0.0.0/8 return
-	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4 }' return
+	# 所有 bypass 规则必须先设标记再 return,否则 TUN 仍会劫持
+	nft add rule inet "$NFT_TABLE" prerouting ip saddr 127.0.0.0/8 meta mark set "$BYPASS_MARK" return
+	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4 }' meta mark set "$BYPASS_MARK" return
 	if [ "$ipv6_enabled" = "1" ]; then
-		nft add rule inet "$NFT_TABLE" prerouting ip6 saddr ::1/128 return
-		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }' return
+		nft add rule inet "$NFT_TABLE" prerouting ip6 saddr ::1/128 meta mark set "$BYPASS_MARK" return
+		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }' meta mark set "$BYPASS_MARK" return
 	fi
 
 	# 绕过中国大陆 IP
 	if [ "$bypass_china" = "1" ]; then
 		if load_china_ipset; then
-			nft add rule inet "$NFT_TABLE" prerouting ip daddr @"$CHINA_SET" meta mark set "$TPROXY_MARK" return
+			nft add rule inet "$NFT_TABLE" prerouting ip daddr @"$CHINA_SET" meta mark set "$BYPASS_MARK" return
 			warp_log "Loaded China IP bypass set"
 		else
 			warp_log "Warning: bypass_china enabled but failed to load china_ip.txt"
@@ -111,36 +169,42 @@ setup_tun_bypass() {
 	fi
 
 	# 绕过 WARP 自身流量 (防止循环)
-	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' meta mark set "$BYPASS_MARK" return
 	if [ "$ipv6_enabled" = "1" ]; then
-		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' return
+		nft add rule inet "$NFT_TABLE" prerouting ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' meta mark set "$BYPASS_MARK" return
 	fi
 
 	# 绕过用户自定义 IP
-	[ -n "$bypass_ips_str" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $bypass_ips_str }" return 2>/dev/null && warp_log "Bypass IPs: $bypass_ips_str"
-	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $oc_bypass_str }" return 2>/dev/null && warp_log "OpenClash bypass IPs: $oc_bypass_str"
+	[ -n "$valid_bypass" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $valid_bypass }" meta mark set "$BYPASS_MARK" return 2>/dev/null && warp_log "Bypass IPs: $valid_bypass"
+	[ -n "$valid_oc" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $valid_oc }" meta mark set "$BYPASS_MARK" return 2>/dev/null && warp_log "OpenClash bypass IPs: $valid_oc"
 
 	# ── output 链 (本机产生的流量) ──
-	nft add rule inet "$NFT_TABLE" output ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' return
+	nft add rule inet "$NFT_TABLE" output ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' meta mark set "$BYPASS_MARK" return
 	if [ "$ipv6_enabled" = "1" ]; then
-		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ ::1/128, fc00::/7, fe80::/10 }' return
+		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }' meta mark set "$BYPASS_MARK" return
 	fi
-	nft add rule inet "$NFT_TABLE" output ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	nft add rule inet "$NFT_TABLE" output ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' meta mark set "$BYPASS_MARK" return
 	if [ "$ipv6_enabled" = "1" ]; then
-		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' return
+		nft add rule inet "$NFT_TABLE" output ip6 daddr '{ 2606:4700::/32, 2606:4700:d000::/48 }' meta mark set "$BYPASS_MARK" return
 	fi
-	[ -n "$bypass_ips_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $bypass_ips_str }" return 2>/dev/null
-	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $oc_bypass_str }" return 2>/dev/null
+
+	# output 链也加 China IP bypass
+	if [ "$bypass_china" = "1" ] && nft list set inet "$NFT_TABLE" "$CHINA_SET" >/dev/null 2>&1; then
+		nft add rule inet "$NFT_TABLE" output ip daddr @"$CHINA_SET" meta mark set "$BYPASS_MARK" return
+	fi
+
+	[ -n "$valid_bypass" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $valid_bypass }" meta mark set "$BYPASS_MARK" return 2>/dev/null
+	[ -n "$valid_oc" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $valid_oc }" meta mark set "$BYPASS_MARK" return 2>/dev/null
 }
 
 teardown_tun_bypass() {
 	if command -v nft >/dev/null 2>&1; then
 		nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
 	fi
-	ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" >/dev/null 2>&1 || true
-	ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 || true
-	ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" >/dev/null 2>&1 || true
-	ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 || true
+	ip rule del fwmark "$BYPASS_MARK" table "$BYPASS_TABLE" >/dev/null 2>&1 || true
+	ip route flush table "$BYPASS_TABLE" >/dev/null 2>&1 || true
+	ip -6 rule del fwmark "$BYPASS_MARK" table "$BYPASS_TABLE" >/dev/null 2>&1 || true
+	ip -6 route flush table "$BYPASS_TABLE" >/dev/null 2>&1 || true
 }
 
 # ── DNS 配置 (nativetun 模式) ─────────────────────────────────────────
@@ -151,14 +215,16 @@ setup_dns() {
 
 	# 查找 dnsmasq 实际使用的 conf-dir
 	local main_conf conf_hash conf_dir
-	main_conf="$(ls /var/etc/dnsmasq.conf.* 2>/dev/null | head -1)"
+	for f in /var/etc/dnsmasq.conf.*; do
+		[ -f "$f" ] && { main_conf="$f"; break; }
+	done
 	if [ -z "$main_conf" ]; then
 		conf_dir="/tmp/dnsmasq.d"
 	else
 		conf_hash="$(basename "$main_conf" | sed 's/dnsmasq.conf.//')"
 		conf_dir="/tmp/dnsmasq.${conf_hash}.d"
 		local configured_dir
-		configured_dir="$(grep '^conf-dir=' "$main_conf" 2>/dev/null | head -1 | sed 's/conf-dir=//' | sed 's/[[:space:]]*$//')"
+		configured_dir="$(grep '^conf-dir=' "$main_conf" 2>/dev/null | head -1 | sed 's/conf-dir=//' | sed 's/,.*//' | sed 's/[[:space:]]*$//')"
 		[ -n "$configured_dir" ] && conf_dir="$configured_dir"
 	fi
 	mkdir -p "$conf_dir" 2>/dev/null
@@ -217,20 +283,21 @@ DNSCONFIG
 		warp_log "IPv6 disabled: filtering AAAA records"
 	fi
 
-	# 重启 dnsmasq
-	killall dnsmasq 2>/dev/null || true
-	sleep 1
-	/etc/init.d/dnsmasq start 2>/dev/null &
-	sleep 2
+	# 重启 dnsmasq (用 init.d 而非 killall,避免杀所有实例)
+	/etc/init.d/dnsmasq restart 2>/dev/null || killall dnsmasq 2>/dev/null || true
 	warp_log "dnsmasq configured: default → 1.1.1.1 (via TUN), CN domains → direct"
 }
 
 teardown_dns() {
-	local main_conf conf_hash conf_dir
-	main_conf="$(ls /var/etc/dnsmasq.conf.* 2>/dev/null | head -1)"
+	local main_conf conf_hash conf_dir configured_dir
+	for f in /var/etc/dnsmasq.conf.*; do
+		[ -f "$f" ] && { main_conf="$f"; break; }
+	done
 	if [ -n "$main_conf" ]; then
 		conf_hash="$(basename "$main_conf" | sed 's/dnsmasq.conf.//')"
 		conf_dir="/tmp/dnsmasq.${conf_hash}.d"
+		configured_dir="$(grep '^conf-dir=' "$main_conf" 2>/dev/null | head -1 | sed 's/conf-dir=//' | sed 's/,.*//' | sed 's/[[:space:]]*$//')"
+		[ -n "$configured_dir" ] && conf_dir="$configured_dir"
 	else
 		conf_dir="/tmp/dnsmasq.d"
 	fi
@@ -243,34 +310,46 @@ teardown_dns() {
 server=223.5.5.5
 EOF
 
-	# 后台重启 dnsmasq
-	(
-		killall dnsmasq 2>/dev/null || true
-		sleep 1
-		mkdir -p /tmp/resolv.conf.d
-		touch /tmp/resolv.conf.d/resolv.conf.auto
-		/etc/init.d/dnsmasq start 2>/dev/null
-		warp_log "DNS restored: dnsmasq with fallback DNS (223.5.5.5)"
-	) &
+	# 重启 dnsmasq (同步,避免竞态)
+	mkdir -p /tmp/resolv.conf.d
+	touch /tmp/resolv.conf.d/resolv.conf.auto
+	/etc/init.d/dnsmasq restart 2>/dev/null || killall dnsmasq 2>/dev/null || true
+	warp_log "DNS restored: dnsmasq with fallback DNS (223.5.5.5)"
 }
 
 # ── 构建 usque 命令行参数 ─────────────────────────────────────────────
+# 返回参数列表,用换行分隔,供 procd 逐个添加
 build_usque_cmd() {
-	local mode="$1"
-	local usque_bin="$2"
-	local socks_port="$3"
-	local http_port="$4"
-	local mtu="$5"
+	local mode="$1" usque_bin="$2" socks_port="$3" http_port="$4" mtu="$5"
 
 	case "$mode" in
 		socks)
-			echo "$usque_bin" socks -c "$USQUE_CONF" -b 0.0.0.0 -p "$socks_port"
+			echo "$usque_bin"
+			echo "socks"
+			echo "-c"
+			echo "$USQUE_CONF"
+			echo "-b"
+			echo "0.0.0.0"
+			echo "-p"
+			echo "$socks_port"
 			;;
 		http-proxy)
-			echo "$usque_bin" http-proxy -c "$USQUE_CONF" -b 0.0.0.0 -p "$http_port"
+			echo "$usque_bin"
+			echo "http-proxy"
+			echo "-c"
+			echo "$USQUE_CONF"
+			echo "-b"
+			echo "0.0.0.0"
+			echo "-p"
+			echo "$http_port"
 			;;
 		nativetun)
-			echo "$usque_bin" nativetun -c "$USQUE_CONF" --mtu "$mtu"
+			echo "$usque_bin"
+			echo "nativetun"
+			echo "-c"
+			echo "$USQUE_CONF"
+			echo "--mtu"
+			echo "$mtu"
 			;;
 		*)
 			return 1
@@ -310,13 +389,19 @@ start_service() {
 	config_get BYPASS_CHINA config bypass_china "0"
 	config_get PRIVATE_KEY config private_key ""
 
+	# 3. 校验数字参数
+	validate_num "$SOCKS_PORT" || { warp_log "Error: invalid socks_port '$SOCKS_PORT'"; return 1; }
+	validate_num "$HTTP_PORT" || { warp_log "Error: invalid http_port '$HTTP_PORT'"; return 1; }
+	validate_num "$MTU" || { warp_log "Error: invalid mtu '$MTU'"; return 1; }
+	validate_num "$CONNECT_PORT" || { warp_log "Error: invalid connect_port '$CONNECT_PORT'"; return 1; }
+
 	# 全局代理时自动切换到 nativetun 模式
 	if [ "$GLOBAL_PROXY" = "1" ] && [ "$MODE" != "nativetun" ]; then
 		warp_log "Global proxy enabled: switching from $MODE to nativetun mode"
 		MODE="nativetun"
 	fi
 
-	# 3. 校验账号状态
+	# 4. 校验账号状态
 	if [ -z "$PRIVATE_KEY" ] && [ ! -f "$USQUE_CONF" ]; then
 		warp_log "No WARP account found. Run 'warp-manager register' first."
 		return 1
@@ -327,36 +412,38 @@ start_service() {
 		return 1
 	fi
 
-	# 4. 确保数据目录存在
+	# 5. 确保数据目录存在
 	mkdir -p "$DATA_DIR"
 
-	# 5. 构建 usque 命令行
-	local base_cmd
-	base_cmd="$(build_usque_cmd "$MODE" "$USQUE_PATH" "$SOCKS_PORT" "$HTTP_PORT" "$MTU")"
-	if [ -z "$base_cmd" ]; then
-		warp_log "Error: Unknown mode '$MODE'"
-		return 1
-	fi
+	# 6. 通过 procd 启动 usque (逐参数传递,避免引号问题)
+	procd_open_instance "warp"
+	procd_set_param command "$USQUE_PATH" "$MODE" -c "$USQUE_CONF"
 
-	# 6. 添加可选标志
-	local cmd_args="$base_cmd"
+	# 根据模式添加模式特定参数
+	case "$MODE" in
+		socks)
+			procd_append_param command -b 0.0.0.0 -p "$SOCKS_PORT"
+			;;
+		http-proxy)
+			procd_append_param command -b 0.0.0.0 -p "$HTTP_PORT"
+			;;
+		nativetun)
+			procd_append_param command --mtu "$MTU"
+			;;
+	esac
 
-	[ "$HTTP2" = "1" ] && cmd_args="$cmd_args --http2"
-	[ "$IPV6" = "1" ] && cmd_args="$cmd_args -6"
-	[ "$INSECURE" = "1" ] && cmd_args="$cmd_args --insecure"
-	[ "$ALWAYS_RECONNECT" != "0" ] && cmd_args="$cmd_args --always-reconnect"
-	[ -n "$SNI" ] && cmd_args="$cmd_args -s \"$SNI\""
-	[ -n "$CONNECT_PORT" ] && [ "$CONNECT_PORT" != "443" ] && cmd_args="$cmd_args -P $CONNECT_PORT"
-	[ -n "$MTU" ] && [ "$MTU" != "1280" ] && cmd_args="$cmd_args -m $MTU"
+	# 添加可选标志
+	[ "$HTTP2" = "1" ] && procd_append_param command --http2
+	[ "$IPV6" = "1" ] && procd_append_param command -6
+	[ "$INSECURE" = "1" ] && procd_append_param command --insecure
+	[ "$ALWAYS_RECONNECT" != "0" ] && procd_append_param command --always-reconnect
+	[ -n "$SNI" ] && procd_append_param command -s "$SNI"
+	[ -n "$CONNECT_PORT" ] && [ "$CONNECT_PORT" != "443" ] && procd_append_param command -P "$CONNECT_PORT"
 
 	if [ "$MODE" = "socks" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
-		cmd_args="$cmd_args -u \"$USERNAME\" -w \"$PASSWORD\""
+		procd_append_param command -u "$USERNAME" -w "$PASSWORD"
 	fi
 
-	# 7. 通过 procd 启动 usque
-	procd_open_instance "warp"
-	# shellcheck disable=SC2086
-	procd_set_param command $cmd_args
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -371,37 +458,46 @@ start_service() {
 	esac
 	warp_log "Started usque in $MODE mode ($mode_desc)"
 
-	# 8. 全局透明代理: nativetun 模式下 usque 创建 TUN, 只需加 bypass 规则 + DNS
+	# 7. 全局透明代理: nativetun 模式下 usque 创建 TUN, 只需加 bypass 规则 + DNS
 	if [ "$GLOBAL_PROXY" = "1" ] && [ "$MODE" = "nativetun" ]; then
-		(sleep 3; setup_tun_bypass "$BYPASS_CHINA" "$IPV6"; setup_dns "$IPV6") &
-		warp_log "Global TUN proxy enabled: bypass rules + DNS configured"
+		# 等待 TUN 设备就绪 (最多 10 秒)
+		local tun_ready=0
+		for i in 1 2 3 4 5 6 7 8 9 10; do
+			if ip link show 2>/dev/null | grep -qE 'tun|utun'; then
+				tun_ready=1
+				break
+			fi
+			sleep 1
+		done
+		if [ "$tun_ready" = "1" ]; then
+			setup_tun_bypass "$BYPASS_CHINA" "$IPV6"
+			setup_dns "$IPV6"
+			warp_log "Global TUN proxy enabled: bypass rules + DNS configured"
+		else
+			warp_log "Warning: TUN device not detected after 10s, bypass rules may not work"
+			setup_tun_bypass "$BYPASS_CHINA" "$IPV6"
+			setup_dns "$IPV6"
+		fi
 	fi
 }
 
 stop_service() {
-	(
-		teardown_tun_bypass
-		teardown_dns
-		warp_log "Service stopped"
-	) &
+	teardown_tun_bypass
+	teardown_dns
+	warp_log "Service stopped"
 }
 
 reload_service() {
+	# 同步清理,避免竞态
 	killall -9 usque 2>/dev/null || true
-	nft delete table inet luci_warp >/dev/null 2>&1 || true
-	ip rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
-	ip route del local 0.0.0.0/0 dev lo table 100 >/dev/null 2>&1 || true
-	ip -6 rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
-	ip -6 route del local ::/0 dev lo table 100 >/dev/null 2>&1 || true
-	for conf_dir in /tmp/dnsmasq.*/warp_dns.conf /tmp/dnsmasq.d/warp_dns.conf; do
-		[ -f "$conf_dir" ] && rm -f "$conf_dir" 2>/dev/null
+	teardown_tun_bypass
+	# 清理 DNS
+	local conf_dir
+	for f in /tmp/dnsmasq.*/warp_dns.conf /tmp/dnsmasq.d/warp_dns.conf; do
+		[ -f "$f" ] && rm -f "$f" 2>/dev/null
 	done
-	killall dnsmasq 2>/dev/null || true
-	(
-		sleep 1
-		mkdir -p /tmp/resolv.conf.d
-		touch /tmp/resolv.conf.d/resolv.conf.auto
-		/etc/init.d/dnsmasq start 2>/dev/null
-		start_service
-	) &
+	/etc/init.d/dnsmasq restart 2>/dev/null || killall dnsmasq 2>/dev/null || true
+	sleep 1
+	# 同步重启,不要在子shell后台
+	start_service
 }

@@ -49,16 +49,18 @@ need_usque() {
 json_get() {
 	local key="$1"
 	local file="$2"
+	local result
 	# jsonfilter 语法:@.key
 	if command -v jsonfilter >/dev/null 2>&1; then
-		jsonfilter -s "$file" -e "@.$key" 2>/dev/null && return 0
+		result="$(jsonfilter -s "$file" -e "@.$key" 2>/dev/null)"
+		[ -n "$result" ] && echo "$result" && return 0
 	fi
-	# jq 回退:.key (转换 jsonfilter 的 @.key 为 .key)
+	# jq 回退:.key (用 // empty 避免输出 "null")
 	if command -v jq >/dev/null 2>&1; then
 		local jq_key
 		jq_key=$(echo "$key" | sed 's/^@\.//')
-		jq -r ".$jq_key" "$file" 2>/dev/null
-		return 0
+		result="$(jq -r ".$jq_key // empty" "$file" 2>/dev/null)"
+		[ -n "$result" ] && echo "$result" && return 0
 	fi
 	return 1
 }
@@ -109,8 +111,13 @@ register_account() {
 
 	if [ -z "$private_key" ]; then
 		msg_err "Failed to extract private_key from config.json."
-		msg_warn "config.json content:"
-		cat "$USQUE_CONF" >&2
+		msg_warn "config.json keys (values redacted):"
+		# 只打印 key 名,不泄露 secrets
+		if command -v jq >/dev/null 2>&1; then
+			jq -r 'keys[]' "$USQUE_CONF" >&2 2>/dev/null
+		else
+			grep -oE '"[^"]+"' "$USQUE_CONF" 2>/dev/null | head -10 >&2
+		fi
 		return 1
 	fi
 
@@ -428,8 +435,9 @@ install_usque() {
 
 	# GitHub release 文件名格式: usque_<version>_<arch>.zip
 	local url="${USQUE_BASE_URL}/usque_${USQUE_VER_NUM}_${arch}.zip"
-	local tmp_zip="/tmp/usque_${arch}_$$.zip"
-	local tmp_dir="/tmp/usque_extract_$$"
+	local tmp_zip tmp_dir
+	tmp_zip="$(mktemp /tmp/usque_XXXXXXXX.zip)"
+	tmp_dir="$(mktemp -d /tmp/usque_extract_XXXXXX)"
 
 	msg_ok "Downloading usque from $url ..."
 	if command -v curl >/dev/null 2>&1; then
