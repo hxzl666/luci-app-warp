@@ -14,15 +14,17 @@ OUTPUT="${REPO_DIR}/${PKG_NAME}_${PKG_VERSION}_${ARCH}.apk"
 
 echo "Building $OUTPUT (arch=$ARCH) ..."
 
-# Check apk availability
-APK_BIN="${APK_BIN:-$(command -v apk 2>/dev/null)}"
-if [ -z "$APK_BIN" ]; then
-    echo "ERROR: 'apk' not found. Set APK_BIN=/path/to/apk or run in Alpine container."
+# Check mkpkg availability (support both standalone mkpkg and apk mkpkg)
+if command -v mkpkg >/dev/null 2>&1; then
+    MKGPKG_CMD="mkpkg"
+elif command -v apk >/dev/null 2>&1; then
+    MKGPKG_CMD="apk mkpkg"
+else
+    echo "ERROR: neither 'mkpkg' nor 'apk mkpkg' found. Install apk-tools."
     exit 1
 fi
-"$APK_BIN" --version >/dev/null 2>&1 || { echo "ERROR: 'apk' not working."; exit 1; }
-# Verify mkpkg is functional (without args it errors with required field, which means it works)
-"$APK_BIN" mkpkg 2>&1 | grep -q "required info field" || { echo "ERROR: 'apk mkpkg' not functional."; exit 1; }
+# Verify mkpkg works (without args it should error with "required info field")
+$MKGPKG_CMD 2>&1 | grep -q "required info field\|Usage\|invalid" || { echo "ERROR: mkpkg not functional."; exit 1; }
 
 # 1. Prepare package root
 cp -r "$REPO_DIR/root/etc" "$PKG_ROOT/"
@@ -56,7 +58,7 @@ POSTINSTALL
 chmod 755 /tmp/post-install.sh
 
 # 5. Build apk
-"$APK_BIN" mkpkg \
+$MKGPKG_CMD \
   --info "name:$PKG_NAME" \
   --info "version:$PKG_VERSION" \
   --info "description:LuCI support for Cloudflare WARP (MASQUE via usque)" \
