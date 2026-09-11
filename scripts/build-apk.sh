@@ -6,7 +6,7 @@ set -e
 
 PKG_NAME=luci-app-warp
 PKG_VERSION=4.2.1-r1
-ARCH=${ARCH:-aarch64_cortex-a53}
+ARCH=${APK_ARCH:-${ARCH:-aarch64_cortex-a53}}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 PKG_ROOT=$(mktemp -d)

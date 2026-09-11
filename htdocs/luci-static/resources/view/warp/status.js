@@ -105,100 +105,147 @@ return view.extend({
 
     handleAction: function (action) {
         var self = this;
-        ui.showModal(_('请稍候...'), [
-            E('p', { 'class': 'spinning' }, _('正在执行操作...'))
-        ]);
 
-        var command = '/usr/bin/warp-manager';
-        var args;
-        switch (action) {
-            case 'register':
-                args = ['register'];
-                break;
-            case 'start':
-                args = ['start'];
-                break;
-            case 'stop':
-                args = ['stop'];
-                break;
-            case 'restart':
-                args = ['restart'];
-                break;
-            case 'test':
-                args = ['test'];
-                break;
-            case 'reset':
-                args = ['reset'];
-                break;
-            default:
-                ui.hideModal();
+        if (action === 'reset') {
+            if (!confirm(_('确定要重置所有 WARP 账户数据？此操作不可撤销。')))
                 return;
         }
 
-        return fs.exec(command, args).then(function (res) {
+        var cmdMap = {
+            'register': 'register',
+            'start': 'start',
+            'stop': 'stop',
+            'restart': 'restart',
+            'test': 'test',
+            'reset': 'reset'
+        };
+
+        if (!cmdMap[action]) {
             ui.hideModal();
+            return;
+        }
 
-            if (res.code) {
-                ui.showModal(_('操作失败'), [
-                    E('pre', { 'style': 'white-space: pre-wrap;' }, res.stderr || res.stdout || _('命令执行失败')),
-                    E('div', { 'class': 'right' }, [
-                        E('button', {
-                            'class': 'btn',
-                            'click': ui.hideModal
-                        }, _('关闭'))
-                    ])
-                ]);
-                return;
-            }
+        var isQuick = (action === 'start' || action === 'stop' || action === 'restart');
+        var waitText = isQuick ? _('正在执行操作，请稍候...') :
+                       action === 'test' ? _('正在测试 WARP 连接，可能需要 15 秒...') :
+                       action === 'register' ? _('正在注册 WARP 账户...') :
+                       _('正在重置账户数据...');
 
-            if (action === 'test') {
-                var output = res.stdout || '';
-                var warpStatus = output.match(/(?:warp=|WARP\s+Status:\s*)([^\n\r]+)/i);
-                var ip = output.match(/(?:ip=|Exit\s+IP:\s*)([^\n\r]+)/i);
-                var loc = output.match(/(?:loc=|Location:\s*)([^\n\r]+)/i);
+        ui.showModal(_('请稍候...'), [
+            E('p', { 'class': 'spinning' }, _(waitText))
+        ]);
 
-                var cleanVal = function(match) {
-                    if (!match) return null;
-                    return match[1].replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
-                };
+        var logFile = '/tmp/warp_action_' + action + '.log';
+        var doneFile = '/tmp/warp_action_' + action + '_done';
 
-                var statusStr = cleanVal(warpStatus);
-                var ipStr = cleanVal(ip);
-                var locStr = cleanVal(loc);
+        /* Background the command: redirect all FDs so rpcd returns immediately,
+           then poll for the done file. This prevents LuCI XHR timeout. */
+        fs.exec('/bin/sh', ['-c',
+            'rm -f ' + doneFile + ' ' + logFile + '; ' +
+            '(/usr/bin/warp-manager ' + cmdMap[action] +
+            ' > ' + logFile + ' 2>&1; echo $?) > ' + doneFile +
+            ' < /dev/null > /dev/null 2>&1 &'
+        ]);
 
-                ui.showModal(_('连接测试结果'), [
-                    E('div', { 'class': 'cbi-section' }, [
-                        E('p', {}, [
-                            E('strong', {}, 'WARP 状态: '),
-                            statusStr ? statusStr : _('未知')
-                        ]),
-                        E('p', {}, [
-                            E('strong', {}, '出口 IP: '),
-                            ipStr ? ipStr : _('未知')
-                        ]),
-                        E('p', {}, [
-                            E('strong', {}, '位置: '),
-                            locStr ? locStr : _('未知')
+        var attempts = 0;
+        var maxAttempts = isQuick ? 10 : 40;
+        var interval = isQuick ? 500 : 1000;
+
+        var pollResult = function () {
+            attempts++;
+
+            return L.resolveDefault(fs.stat(doneFile), null).then(function (stat) {
+                if (!stat) {
+                    if (attempts < maxAttempts) {
+                        /* Update modal text to show progress */
+                        var dots = '.'.repeat(Math.min(attempts, 10));
+                        var el = document.querySelector('.spinning');
+                        if (el) {
+                            el.textContent = waitText.replace('...', dots);
+                        }
+                        return new Promise(function (resolve) {
+                            setTimeout(resolve, interval);
+                        }).then(pollResult);
+                    }
+
+                    /* Timeout */
+                    ui.hideModal();
+                    ui.showModal(_('操作超时'), [
+                        E('p', {}, _('操作未在预期时间内完成，请查看日志。')),
+                        E('div', { 'class': 'right' }, [
+                            E('button', { 'class': 'btn', 'click': ui.hideModal }, _('关闭'))
                         ])
-                    ]),
-                    E('div', { 'class': 'right' }, [
-                        E('button', {
-                            'class': 'btn',
-                            'click': ui.hideModal
-                        }, _('关闭'))
-                    ])
-                ]);
-            } else {
-                ui.addNotification(null, E('pre', { 'style': 'white-space: pre-wrap;' },
-                    res.stdout || _('操作完成')), 'success');
-                return uci.load('warp').then(function() {
-                    return self.pollStatus();
+                    ]);
+                    fs.exec('/bin/rm', ['-f', logFile, doneFile]);
+                    return;
+                }
+
+                /* Done — read exit code + log */
+                return L.resolveDefault(fs.read(doneFile), '1').then(function (exitStr) {
+                    var exitCode = parseInt(exitStr.trim(), 10) || 0;
+                    return L.resolveDefault(fs.read(logFile), '').then(function (output) {
+                        fs.exec('/bin/rm', ['-f', logFile, doneFile]);
+
+                        if (exitCode !== 0) {
+                            ui.hideModal();
+                            ui.showModal(_('操作失败'), [
+                                E('pre', { 'style': 'white-space: pre-wrap;' }, output || _('命令执行失败')),
+                                E('div', { 'class': 'right' }, [
+                                    E('button', { 'class': 'btn', 'click': ui.hideModal }, _('关闭'))
+                                ])
+                            ]);
+                            return;
+                        }
+
+                        if (action === 'test') {
+                            var warpStatus = output.match(/(?:warp=|WARP\s+Status:\s*)([^\n\r]+)/i);
+                            var ip = output.match(/(?:ip=|Exit\s+IP:\s*)([^\n\r]+)/i);
+                            var loc = output.match(/(?:loc=|Location:\s*)([^\n\r]+)/i);
+
+                            var cleanVal = function (match) {
+                                if (!match) return null;
+                                return match[1].replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
+                            };
+
+                            var statusStr = cleanVal(warpStatus);
+                            var ipStr = cleanVal(ip);
+                            var locStr = cleanVal(loc);
+
+                            ui.hideModal();
+                            ui.showModal(_('连接测试结果'), [
+                                E('div', { 'class': 'cbi-section' }, [
+                                    E('p', {}, [
+                                        E('strong', {}, 'WARP 状态: '),
+                                        statusStr ? statusStr : _('未知')
+                                    ]),
+                                    E('p', {}, [
+                                        E('strong', {}, '出口 IP: '),
+                                        ipStr ? ipStr : _('未知')
+                                    ]),
+                                    E('p', {}, [
+                                        E('strong', {}, '位置: '),
+                                        locStr ? locStr : _('未知')
+                                    ])
+                                ]),
+                                E('div', { 'class': 'right' }, [
+                                    E('button', { 'class': 'btn', 'click': ui.hideModal }, _('关闭'))
+                                ])
+                            ]);
+                        } else {
+                            ui.hideModal();
+                            ui.addNotification(null, E('pre', { 'style': 'white-space: pre-wrap;' },
+                                output || _('操作完成')), 'success');
+                            return uci.load('warp').then(function () {
+                                return self.pollStatus();
+                            });
+                        }
+                    });
                 });
-            }
-        }).catch(function (e) {
-            ui.hideModal();
-            ui.addNotification(null, E('p', _('操作失败: ') + e.message), 'error');
-        });
+            });
+        };
+
+        /* Start polling after a short delay */
+        setTimeout(pollResult, isQuick ? 500 : 1000);
     },
 
     render: function (data) {

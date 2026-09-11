@@ -119,6 +119,15 @@ setup_tproxy() {
 	# 绕过 WARP 自身流量 (防止循环)
 	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
 
+	# 绕过用户自定义 IP (bypass_ips + openclash_bypass_ips)
+	local bypass_ips_str
+	bypass_ips_str="$(uci -q get warp.config.bypass_ips 2>/dev/null)"
+	[ -n "$bypass_ips_str" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $bypass_ips_str }" return 2>/dev/null && warp_log "Bypass IPs (prerouting): $bypass_ips_str"
+
+	local oc_bypass_str
+	oc_bypass_str="$(uci -q get warp.config.openclash_bypass_ips 2>/dev/null)"
+	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" prerouting ip daddr "{ $oc_bypass_str }" return 2>/dev/null && warp_log "OpenClash bypass IPs (prerouting): $oc_bypass_str"
+
 	# TCP TPROXY 规则 (只拦 IPv4 TCP)
 	nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
 	warp_log "Setup nftables TPROXY for IPv4 TCP only"
@@ -128,6 +137,9 @@ setup_tproxy() {
 	nft add rule inet "$NFT_TABLE" output ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' return
 	# WARP MASQUE 端点 bypass
 	nft add rule inet "$NFT_TABLE" output ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	# 用户自定义 bypass_ips (output 链也生效,防止本机流量劫持 frp/anytls 隧道)
+	[ -n "$bypass_ips_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $bypass_ips_str }" return 2>/dev/null
+	[ -n "$oc_bypass_str" ] && nft add rule inet "$NFT_TABLE" output ip daddr "{ $oc_bypass_str }" return 2>/dev/null
 	# 标记本机 IPv4 TCP 流量走 TPROXY
 	nft add rule inet "$NFT_TABLE" output meta l4proto tcp meta mark set "$TPROXY_MARK"
 }
@@ -378,7 +390,7 @@ start_service() {
 	[ "$ALWAYS_RECONNECT" != "0" ] && cmd_args="$cmd_args --always-reconnect"
 
 	# -s: 自定义 SNI
-	[ -n "$SNI" ] && cmd_args="$cmd_args -s $SNI"
+	[ -n "$SNI" ] && cmd_args="$cmd_args -s \"$SNI\""
 
 	# -P: MASQUE 连接端口
 	[ -n "$CONNECT_PORT" ] && [ "$CONNECT_PORT" != "443" ] && cmd_args="$cmd_args -P $CONNECT_PORT"
@@ -388,7 +400,7 @@ start_service() {
 
 	# -u / -w: SOCKS5 认证 (仅 socks 模式)
 	if [ "$MODE" = "socks" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
-		cmd_args="$cmd_args -u $USERNAME -w $PASSWORD"
+		cmd_args="$cmd_args -u \"$USERNAME\" -w \"$PASSWORD\""
 	fi
 
 	# 7. 通过 procd 启动 usque
@@ -440,8 +452,10 @@ reload_service() {
 	nft delete table inet luci_warp >/dev/null 2>&1 || true
 	ip rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
 	ip route del local 0.0.0.0/0 dev lo table 100 >/dev/null 2>&1 || true
-	# 删除备份 DNS 配置
-	rm -f /tmp/dnsmasq.cfg01411c.d/backup_dns.conf /tmp/dnsmasq.d/backup_dns.conf 2>/dev/null || true
+	# 删除备份 DNS 配置 (动态查找所有可能的 dnsmasq conf-dir)
+	for conf_dir in /tmp/dnsmasq.*/backup_dns.conf /tmp/dnsmasq.d/backup_dns.conf; do
+		[ -f "$conf_dir" ] && rm -f "$conf_dir" 2>/dev/null
+	done
 	killall dnsmasq 2>/dev/null || true
 	# 后台恢复 dnsmasq + 启动 WARP
 	(

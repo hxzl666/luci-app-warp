@@ -8,6 +8,7 @@ DATA_DIR="/etc/warp"
 USQUE_CONF="$DATA_DIR/config.json"
 USQUE_BIN="${USQUE_BIN:-/usr/bin/usque}"
 USQUE_VERSION="v4.2.1"
+USQUE_VER_NUM="4.2.1"
 USQUE_BASE_URL="https://github.com/Diniboy1123/usque/releases/download/${USQUE_VERSION}"
 
 # ── 颜色输出 ──────────────────────────────────────────────────────────
@@ -426,7 +427,7 @@ install_usque() {
 	msg_ok "Detected architecture: $arch"
 
 	# GitHub release 文件名格式: usque_<version>_<arch>.zip
-	local url="${USQUE_BASE_URL}/usque_${USQUE_VERSION}_${arch}.zip"
+	local url="${USQUE_BASE_URL}/usque_${USQUE_VER_NUM}_${arch}.zip"
 	local tmp_zip="/tmp/usque_${arch}_$$.zip"
 	local tmp_dir="/tmp/usque_extract_$$"
 
@@ -463,7 +464,11 @@ install_usque() {
 	bin_found="$(find "$tmp_dir" -name 'usque' -type f 2>/dev/null | head -1)"
 	if [ -z "$bin_found" ]; then
 		# 也可能叫 usque_<arch> 或其他名字
-		bin_found="$(find "$tmp_dir" -type f -perm +111 2>/dev/null | head -1)"
+		bin_found="$(find "$tmp_dir" -type f \( -perm -u+x -o -perm -g+x -o -perm -o+x \) 2>/dev/null | head -1)"
+		# 回退: 如果 find 不支持 -perm 语法,直接找名为 usque* 的文件
+		if [ -z "$bin_found" ]; then
+			bin_found="$(find "$tmp_dir" -type f -name 'usque*' 2>/dev/null | head -1)"
+		fi
 	fi
 
 	if [ -z "$bin_found" ]; then
