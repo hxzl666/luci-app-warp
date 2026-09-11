@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build luci-app-warp .ipk (OpenWrt 24.x) — manual tar packaging
-# Works on any Linux without OpenWrt build system.
+# Build luci-app-warp .ipk — manual tar packaging, no OpenWrt SDK needed.
+# Works on any Linux with standard tar/gzip.
 set -e
 
 PKG_NAME=luci-app-warp
@@ -15,14 +15,13 @@ OUTPUT="${REPO_DIR}/${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}.ipk"
 
 echo "Building $OUTPUT (arch=$ARCH) ..."
 
-# 1. Prepare data directory (create warp dir BEFORE cp to avoid tar race)
+# 1. Prepare data directory
+# root/etc -> BUILD_DIR/etc (config, init.d, etc.)
+cp -r "$REPO_DIR/root/etc" "$BUILD_DIR/"
 mkdir -p "$BUILD_DIR/etc/warp"
-cp -r "$REPO_DIR/root/etc/"* "$BUILD_DIR/etc/"
+# root/usr -> BUILD_DIR/usr (bin, share)
 cp -r "$REPO_DIR/root/usr" "$BUILD_DIR/"
-cp -r "$REPO_DIR/htdocs" "$BUILD_DIR/www"
-mv "$BUILD_DIR/www" "$BUILD_DIR/www/luci-static" 2>/dev/null || true
-# Fix: root/htdocs already has luci-static prefix
-rm -rf "$BUILD_DIR/www"
+# htdocs -> BUILD_DIR/www (luci-static views)
 cp -r "$REPO_DIR/htdocs" "$BUILD_DIR/www"
 
 # 2. Set permissions
@@ -57,7 +56,7 @@ Description: LuCI support for Cloudflare WARP (MASQUE via usque).
  Supports OpenClash bypass, China IP list, and multiple proxy modes.
 EOF
 
-# 6. Build control.tar.gz (control in tar root!)
+# 6. Build control.tar.gz (control must be in tar root!)
 cd "$WORK_DIR"
 tar --numeric-owner --owner=0 --group=0 -czf control.tar.gz control
 

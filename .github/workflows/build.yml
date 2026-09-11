@@ -11,37 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build ipk via OpenWrt SDK
+      - name: Build ipk
         run: |
-          apt-get update && apt-get install -y             build-essential wget file unzip zlib1g-dev
-
-          # Download OpenWrt 24.10 SDK (x86_64)
-          wget -q https://downloads.openwrt.org/releases/24.10.2/targets/x86/64/openwrt-sdk-24.10.2-x86-64_gcc-14.2.0_musl.Linux-x86_64.tar.xz
-          tar -xf openwrt-sdk-*.tar.xz
-          mv openwrt-sdk-* openwrt-sdk
-
-          # Add package to SDK
-          cp -r . openwrt-sdk/package/luci-app-warp
-          cd openwrt-sdk
-          echo "src-git base https://git.openwrt.org/openwrt/openwrt.git;openwrt-24.10" > feeds.conf
-          echo "src-git packages https://git.openwrt.org/feed/packages.git;openwrt-24.10" >> feeds.conf
-          echo "src-git luci https://git.openwrt.org/project/luci.git;openwrt-24.10" >> feeds.conf
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          echo "CONFIG_PACKAGE_luci-app-warp=m" >> .config
-          make defconfig
-          make package/luci-app-warp/compile -j$(nproc) V=s
-
-          # Collect artifacts
-          mkdir -p ../artifacts
-          find bin -name "*luci-app-warp*.ipk" -exec cp {} ../artifacts/ \;
-          ls -la ../artifacts/
+          chmod +x scripts/build-ipk.sh
+          scripts/build-ipk.sh
 
       - name: Upload ipk artifact
         uses: actions/upload-artifact@v4
         with:
           name: luci-app-warp-ipk
-          path: artifacts/*.ipk
+          path: luci-app-warp*.ipk
 
   build-apk:
     runs-on: ubuntu-latest
@@ -51,7 +30,11 @@ jobs:
       - name: Build apk via Alpine container
         run: |
           chmod +x scripts/build-apk.sh
-          docker run --rm             -v "$PWD:/repo"             -w /repo             alpine:3.20             sh scripts/build-apk.sh
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            alpine:3.20 \
+            sh scripts/build-apk.sh
 
       - name: Upload apk artifact
         uses: actions/upload-artifact@v4
@@ -81,4 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF#refs/tags/v}"             dist/*.ipk dist/*.apk             --title "${GITHUB_REF#refs/tags/v}"             --generate-notes
+          gh release create "${GITHUB_REF#refs/tags/v}" \
+            dist/*.ipk dist/*.apk \
+            --title "${GITHUB_REF#refs/tags/v}" \
+            --generate-notes

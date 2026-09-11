@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build luci-app-warp .apk (OpenWrt 25.x) — requires apk-tools
-# Run in Alpine container or on system with apk mkpkg available.
+# Build luci-app-warp .apk (OpenWrt 25.x) — requires apk-tools.
+# Best run inside Alpine container: docker run --rm -v $PWD:/repo -w /repo alpine:3.20 sh scripts/build-apk.sh
+# Or set APK_BIN=/path/to/apk on any system with apk-tools.
 set -e
 
 PKG_NAME=luci-app-warp
@@ -13,7 +14,7 @@ OUTPUT="${REPO_DIR}/${PKG_NAME}_${PKG_VERSION}_${ARCH}.apk"
 
 echo "Building $OUTPUT (arch=$ARCH) ..."
 
-# Check apk availability (allow APK_BIN env to override path)
+# Check apk availability
 APK_BIN="${APK_BIN:-$(command -v apk 2>/dev/null)}"
 if [ -z "$APK_BIN" ]; then
     echo "ERROR: 'apk' not found. Set APK_BIN=/path/to/apk or run in Alpine container."
@@ -25,9 +26,9 @@ fi
 
 # 1. Prepare package root
 cp -r "$REPO_DIR/root/etc" "$PKG_ROOT/"
+mkdir -p "$PKG_ROOT/etc/warp"
 cp -r "$REPO_DIR/root/usr" "$PKG_ROOT/"
 cp -r "$REPO_DIR/htdocs" "$PKG_ROOT/www"
-mkdir -p "$PKG_ROOT/etc/warp"
 
 # 2. Set permissions
 chmod 755 "$PKG_ROOT/etc/init.d/warp" "$PKG_ROOT/etc/init.d/warp-cron"
