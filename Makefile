@@ -17,16 +17,16 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Cloudflare WARP (MASQUE via usque)
-  DEPENDS:=+luci-base +jsonfilter +ca-bundle +jq
+  DEPENDS:=+luci-base +jsonfilter +ca-bundle +jq +kmod-tun
   URL:=https://github.com/hxzl666/luci-app-warp
   PKGARCH:=all
 endef
 
 define Package/$(PKG_NAME)/description
   LuCI interface for managing Cloudflare WARP via usque (MASQUE protocol).
-  Provides transparent proxy via TPROXY + ipt2socks + dns2socks for DNS leak protection.
-  Features include auto registration, OpenClash bypass, China IP list,
-  and multiple proxy modes (SOCKS/HTTP/transparent).
+  Provides transparent proxy via usque nativetun (TUN device) — no ipt2socks
+  or dns2socks required. Features include auto registration, OpenClash bypass,
+  China IP list, and multiple proxy modes (SOCKS/HTTP/TUN).
   usque binary is auto-downloaded at runtime from GitHub releases.
 endef
 

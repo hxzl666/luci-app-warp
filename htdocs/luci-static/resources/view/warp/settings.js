@@ -148,7 +148,7 @@ return view.extend({
 
         o = s.option(form.Flag, 'global_proxy', _('全局代理'));
         o.default = '0';
-        o.description = _('启用后，通过 nftables TPROXY 透明代理将所有局域网流量转发到 WARP。与其他透明代理(PassWall等)同时使用时必须关闭。');
+        o.description = _('启用后，自动切换到 TUN 模式，usque 创建虚拟网卡接管全部流量，无需 ipt2socks/dns2socks。与其它透明代理同时使用时必须关闭。');
 
         o = s.option(form.Flag, 'bypass_china', _('绕过中国大陆IP'));
         o.default = '0';
