@@ -6,32 +6,27 @@
 'require uci';
 
 return view.extend({
-    // 加载配置和依赖环境检查
     load: function () {
         return Promise.all([
             uci.load('warp'),
             L.resolveDefault(fs.exec('/bin/netstat', ['-tln']), { stdout: '' }),
-            L.resolveDefault(fs.stat('/etc/warp/reg.json'), null),
-            // 检测是否安装了 PassWall 或 PassWall 2 插件
-            L.resolveDefault(fs.stat('/etc/config/passwall'), null),
-            L.resolveDefault(fs.stat('/etc/config/passwall_dev'), null)
+            L.resolveDefault(fs.stat('/etc/warp/config.json'), null)
         ]);
     },
 
     render: function (data) {
         var netstatOutput = data[1].stdout || '';
         var accountExists = data[2] !== null;
-        var hasPasswall = data[3] !== null || data[4] !== null;
-        
+
         var socksPort = uci.get('warp', 'config', 'socks_port') || '1080';
         var httpPort = uci.get('warp', 'config', 'http_port') || '8118';
 
         var m, s, o;
 
-        m = new form.Map('warp', _('Cloudflare WARP'),
-            _('Cloudflare WARP 是一个免费的VPN服务，本插件已切换为通过 sing-box (WireGuard) 实现，支持前置代理。'));
+        m = new form.Map('warp', _('Cloudflare WARP (MASQUE)'),
+            _('Cloudflare WARP 是一个免费的VPN服务，本插件通过 usque (MASQUE 协议) 实现，支持 SOCKS5/HTTP 代理和透明代理。'));
 
-        // 状态显示区域
+        // 运行状态显示
         s = m.section(form.NamedSection, 'config', 'warp', _('运行状态'));
         s.anonymous = true;
 
@@ -63,120 +58,78 @@ return view.extend({
         o.rmempty = false;
         o.default = '0';
 
-        o = s.option(form.Value, 'endpoint', _('服务器地址'));
-        o.placeholder = '162.159.193.1:2408';
+        o = s.option(form.ListValue, 'mode', _('运行模式'));
+        o.value('socks', 'SOCKS5 代理');
+        o.value('http-proxy', 'HTTP 代理');
+        o.value('nativetun', '原生隧道 (透明代理)');
+        o.default = 'socks';
+        o.description = _('选择 WARP 的运行模式。SOCKS5/HTTP 模式仅提供本地代理端口，原生隧道模式将创建虚拟网卡实现透明代理。');
+
+        o = s.option(form.Value, 'license_key', _('WARP+ 许可证密钥'));
+        o.password = true;
         o.rmempty = true;
-        o.description = _('自定义 WARP 服务器端点地址和端口 (例如: 162.159.193.1:2408)。如留空，将自动使用默认端点。');
+        o.description = _('可选。填入 WARP+ 许可证密钥以启用 WARP+ 功能。留空则使用免费版 WARP。');
 
-        // 前置代理设置
-        s = m.section(form.NamedSection, 'config', 'warp', _('前置代理设置'));
-        s.anonymous = true;
-
-        o = s.option(form.Flag, 'proxy_enabled', _('启用前置代理'));
-        o.default = '0';
-        
-        var proxyDesc = _('通过本地前置代理连接 WARP 端点，适合在国内无法直连 WARP 的环境。');
-        if (hasPasswall) {
-            proxyDesc += '<br/><strong style="color: #28a745;">' + _('检测到您的系统已安装 PassWall，推荐启用前置代理并将其设置为 PassWall 的 Socks5 本地代理（默认端口通常为 1081 或 1082）。') + '</strong>';
-        }
-        o.description = proxyDesc;
-
-        o = s.option(form.Value, 'proxy_link', _('前置代理节点链接'));
-        o.placeholder = 'vless://uuid@server:port?security=tls&sni=example.com#node_name';
-        o.description = _('支持直接粘贴 vless://、vmess://、trojan://、hysteria2://、tuic://、socks5:// 格式的单节点链接，系统将自动解析并回填下方的参数。');
-        o.depends('proxy_enabled', '1');
-
-        o = s.option(form.ListValue, 'proxy_type', _('前置代理类型'));
-        o.value('socks5', 'SOCKS5');
-        o.value('http', 'HTTP');
-        o.value('vless', 'VLESS');
-        o.value('vmess', 'VMess');
-        o.value('trojan', 'Trojan');
-        o.value('hysteria2', 'Hysteria 2');
-        o.value('tuic', 'TUIC v5');
-        o.default = 'socks5';
-        o.depends('proxy_enabled', '1');
-
-        o = s.option(form.Value, 'proxy_addr', _('前置代理地址'));
-        o.default = '127.0.0.1';
+        o = s.option(form.Value, 'mtu', _('MTU'));
+        o.datatype = 'uinteger';
+        o.default = '1280';
         o.rmempty = false;
-        o.depends('proxy_enabled', '1');
+        o.description = _('MASQUE 隧道的最大传输单元 (MTU)。');
 
-        o = s.option(form.Value, 'proxy_port', _('前置代理端口'));
+        o = s.option(form.Flag, 'ipv6', _('启用 IPv6'));
+        o.default = '0';
+        o.description = _('启用后，MASQUE 隧道将支持 IPv6 流量。');
+
+        o = s.option(form.Flag, 'http2', _('启用 HTTP/2'));
+        o.default = '0';
+        o.description = _('启用 HTTP/2 多路复用，可提升 MASQUE 连接性能。');
+
+        o = s.option(form.Value, 'sni', _('SNI'));
+        o.placeholder = 'cloudflare-quake.com';
+        o.rmempty = true;
+        o.description = _('MASQUE 连接的 TLS SNI (Server Name Indication)。留空使用默认值。');
+
+        o = s.option(form.Value, 'connect_port', _('连接端口'));
         o.datatype = 'port';
-        o.default = '1081';
+        o.default = '443';
         o.rmempty = false;
-        o.depends('proxy_enabled', '1');
+        o.description = _('MASQUE 连接 Cloudflare 的目标端口。');
 
-        o = s.option(form.Value, 'proxy_uuid', _('UUID / 用户ID'));
-        o.password = true;
-        o.rmempty = true;
-        o.depends('proxy_type', 'vless');
-        o.depends('proxy_type', 'vmess');
-        o.depends('proxy_type', 'tuic');
+        o = s.option(form.Flag, 'always_reconnect', _('自动重连'));
+        o.default = '1';
+        o.description = _('连接断开后自动重连。');
 
-        o = s.option(form.Value, 'proxy_password', _('密码'));
-        o.password = true;
-        o.rmempty = true;
-        o.depends('proxy_type', 'trojan');
-        o.depends('proxy_type', 'hysteria2');
-        o.depends('proxy_type', 'tuic');
-
-        o = s.option(form.Flag, 'proxy_tls', _('启用 TLS'));
+        o = s.option(form.Flag, 'insecure', _('跳过证书验证'));
         o.default = '0';
-        o.depends('proxy_type', 'vless');
-        o.depends('proxy_type', 'vmess');
-        o.depends('proxy_type', 'trojan');
+        o.description = _('跳过 TLS 证书验证 (不推荐，仅用于调试)。');
 
-        o = s.option(form.Value, 'proxy_sni', _('SNI / Server Name'));
-        o.placeholder = 'example.com';
-        o.rmempty = true;
-        o.depends('proxy_tls', '1');
-        o.depends('proxy_type', 'hysteria2');
-        o.depends('proxy_type', 'tuic');
-
-        o = s.option(form.ListValue, 'proxy_vless_flow', _('VLESS 流控 (Flow)'));
-        o.value('', _('无 (None)'));
-        o.value('xtls-rprx-vision', 'xtls-rprx-vision');
-        o.default = '';
-        o.depends('proxy_type', 'vless');
-
-        o = s.option(form.ListValue, 'proxy_vmess_security', _('VMess 加密方式'));
-        o.value('auto', 'auto');
-        o.value('none', 'none');
-        o.value('zero', 'zero');
-        o.value('aes-128-gcm', 'aes-128-gcm');
-        o.value('chacha20-poly1305', 'chacha20-poly1305');
-        o.default = 'auto';
-        o.depends('proxy_type', 'vmess');
-
-        // 代理与接管设置
-        s = m.section(form.NamedSection, 'config', 'warp', _('全局透明代理'));
+        // SOCKS5 认证
+        s = m.section(form.NamedSection, 'config', 'warp', _('SOCKS5 认证'));
         s.anonymous = true;
 
-        o = s.option(form.Flag, 'global_proxy', _('全局代理'));
-        o.default = '0';
-        o.description = _('启用后，通过 nftables TPROXY 透明代理将所有局域网流量转发到 WARP。与 PassWall、OpenClash 等透明代理共存时必须关闭。');
+        o = s.option(form.Value, 'username', _('用户名'));
+        o.rmempty = true;
+        o.description = _('SOCKS5 代理的用户名认证 (可选)。');
 
-        o = s.option(form.Flag, 'bypass_china', _('绕过中国大陆IP'));
-        o.default = '0';
-        o.description = _('仅在全局代理开启时有效。启用后，访问中国大陆IP将直连不走 WARP。');
-        o.depends('global_proxy', '1');
+        o = s.option(form.Value, 'password', _('密码'));
+        o.password = true;
+        o.rmempty = true;
+        o.description = _('SOCKS5 代理的密码认证 (可选)。');
 
-        // SOCKS5 代理
+        // SOCKS5 本地代理
         s = m.section(form.NamedSection, 'config', 'warp', _('SOCKS5 本地代理'));
         s.anonymous = true;
 
         o = s.option(form.Flag, 'socks_enabled', _('启用 SOCKS5 代理'));
         o.default = '1';
-        o.description = _('在本地开启 SOCKS5 代理端口。注意：全局代理功能依赖 SOCKS5 代理。');
+        o.description = _('在本地开启 SOCKS5 代理端口。');
 
         o = s.option(form.Value, 'socks_port', _('SOCKS5 端口'));
         o.datatype = 'port';
         o.default = '1080';
         o.depends('socks_enabled', '1');
 
-        // HTTP 代理
+        // HTTP 本地代理
         s = m.section(form.NamedSection, 'config', 'warp', _('HTTP 本地代理'));
         s.anonymous = true;
 
@@ -189,131 +142,19 @@ return view.extend({
         o.default = '8118';
         o.depends('http_enabled', '1');
 
-        return m.render().then(L.bind(function(viewEl) {
-            var linkInput = viewEl.querySelector('[name="cbid.warp.config.proxy_link"]');
-            if (linkInput) {
-                linkInput.addEventListener('input', function(ev) {
-                    var val = ev.target.value.trim();
-                    if (!val) return;
-                    
-                    var scheme = '';
-                    if (val.indexOf('://') !== -1) {
-                        scheme = val.split('://')[0].toLowerCase();
-                    } else {
-                        return;
-                    }
-                    
-                    var type = '', addr = '', port = '', uuid = '', password = '', tls = '0', sni = '', flow = '', security = 'auto';
-                    
-                    if (scheme === 'vmess') {
-                        var b64 = val.substring(8);
-                        try {
-                            var hashIdx = b64.indexOf('#');
-                            if (hashIdx !== -1) b64 = b64.substring(0, hashIdx);
-                            var jsonStr = atob(b64);
-                            var obj = JSON.parse(jsonStr);
-                            type = 'vmess';
-                            addr = obj.add || '';
-                            port = obj.port || '';
-                            uuid = obj.id || '';
-                            security = obj.scy || 'auto';
-                            tls = (obj.tls === 'tls') ? '1' : '0';
-                            sni = obj.sni || obj.host || '';
-                        } catch(e) {}
-                    } else if (['vless', 'trojan', 'hysteria2', 'tuic', 'socks5', 'http'].indexOf(scheme) !== -1) {
-                        type = scheme;
-                        if (scheme === 'socks5') type = 'socks5';
-                        
-                        var remaining = val.substring(scheme.length + 3);
-                        var hashIdx = remaining.indexOf('#');
-                        if (hashIdx !== -1) remaining = remaining.substring(0, hashIdx);
-                        
-                        var queryStr = '';
-                        var queryIdx = remaining.indexOf('?');
-                        if (queryIdx !== -1) {
-                            queryStr = remaining.substring(queryIdx + 1);
-                            remaining = remaining.substring(0, queryIdx);
-                        }
-                        
-                        var userInfo = '';
-                        var hostPort = remaining;
-                        var atIdx = remaining.indexOf('@');
-                        if (atIdx !== -1) {
-                            userInfo = remaining.substring(0, atIdx);
-                            hostPort = remaining.substring(atIdx + 1);
-                        }
-                        
-                        if (hostPort.indexOf('[') !== -1) {
-                            var closeBracket = hostPort.indexOf(']');
-                            addr = hostPort.substring(1, closeBracket);
-                            var lastColon = hostPort.lastIndexOf(':');
-                            if (lastColon > closeBracket) {
-                                port = hostPort.substring(lastColon + 1);
-                            }
-                        } else {
-                            var colonIdx = hostPort.lastIndexOf(':');
-                            if (colonIdx !== -1) {
-                                addr = hostPort.substring(0, colonIdx);
-                                port = hostPort.substring(colonIdx + 1);
-                            } else {
-                                addr = hostPort;
-                            }
-                        }
-                        
-                        if (userInfo) {
-                            if (scheme === 'tuic') {
-                                var parts = userInfo.split(':');
-                                uuid = parts[0] || '';
-                                password = parts[1] || '';
-                            } else if (scheme === 'vless') {
-                                uuid = userInfo;
-                            } else {
-                                password = userInfo;
-                            }
-                        }
-                        
-                        if (queryStr) {
-                            var queryParams = {};
-                            var pairs = queryStr.split('&');
-                            for (var i = 0; i < pairs.length; i++) {
-                                var p = pairs[i].split('=');
-                                if (p.length === 2) {
-                                    queryParams[p[0].toLowerCase()] = decodeURIComponent(p[1]);
-                                }
-                            }
-                            sni = queryParams['sni'] || queryParams['peer'] || queryParams['host'] || '';
-                            flow = queryParams['flow'] || '';
-                            var sec = queryParams['security'] || '';
-                            tls = (sec === 'tls' || queryParams['tls'] === '1') ? '1' : '0';
-                        }
-                        
-                        if (scheme === 'hysteria2' || scheme === 'tuic') {
-                            tls = '1';
-                        }
-                    }
-                    
-                    var setVal = function(optName, optVal) {
-                        var input = viewEl.querySelector('[name="cbid.warp.config.' + optName + '"]');
-                        if (input) {
-                            input.value = optVal;
-                            input.dispatchEvent(new Event('change'));
-                        }
-                    };
-                    
-                    if (type) {
-                        setVal('proxy_type', type);
-                        setVal('proxy_addr', addr);
-                        setVal('proxy_port', port);
-                        setVal('proxy_uuid', uuid);
-                        setVal('proxy_password', password);
-                        setVal('proxy_tls', tls);
-                        setVal('proxy_sni', sni);
-                        setVal('proxy_vless_flow', flow);
-                        setVal('proxy_vmess_security', security);
-                    }
-                });
-            }
-            return viewEl;
-        }, this));
+        // 全局透明代理
+        s = m.section(form.NamedSection, 'config', 'warp', _('全局透明代理'));
+        s.anonymous = true;
+
+        o = s.option(form.Flag, 'global_proxy', _('全局代理'));
+        o.default = '0';
+        o.description = _('启用后，通过 nftables TPROXY 透明代理将所有局域网流量转发到 WARP。与其他透明代理(PassWall等)同时使用时必须关闭。');
+
+        o = s.option(form.Flag, 'bypass_china', _('绕过中国大陆IP'));
+        o.default = '0';
+        o.description = _('仅在全局代理开启时有效。启用后，访问中国大陆IP将直连不走 WARP。');
+        o.depends('global_proxy', '1');
+
+        return m.render();
     }
 });

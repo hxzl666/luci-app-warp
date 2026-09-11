@@ -21,7 +21,7 @@
                 "/usr/bin/warp": [
                     "exec"
                 ],
-                "/usr/bin/ipt2socks": [
+                "/usr/bin/usque": [
                     "exec"
                 ],
                 "/usr/bin/warp-update-china": [

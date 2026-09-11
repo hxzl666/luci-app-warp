@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# Cloudflare WARP 启动服务，改用 sing-box (WireGuard) 作为底层核心
+# Cloudflare WARP 启动服务，使用 usque (MASQUE 协议) 作为底层核心
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 START=99
@@ -7,28 +7,33 @@ STOP=10
 USE_PROCD=1
 
 IPT2SOCKS_BIN="/usr/bin/ipt2socks"
+DNS2SOCKS_BIN="/usr/bin/dns2socks"
 NFT_TABLE="luci_warp"
 TPROXY_MARK="0x2333"
 TPROXY_TABLE="100"
 CHINA_SET="china_ips"
 LOG_FILE="/var/log/warp.log"
 IPT2SOCKS_PID="/var/run/warp-ipt2socks.pid"
+DNS2SOCKS_PID="/var/run/warp-dns2socks.pid"
+DNSMASQ_CONF_DIR=""
+DNSMASQ_CONF=""
 DATA_DIR="/etc/warp"
-SINGBOX_CONF="$DATA_DIR/sing-box.json"
+USQUE_CONF="$DATA_DIR/config.json"
+USQUE_BIN_DEFAULT="/usr/bin/usque"
 
 warp_log() {
-	mkdir -p /var/log 2>/dev/null || true
+	mkdir -p /var/log /var/lock /var/run 2>/dev/null || true
 	printf '%s warp: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
 	logger -t warp "$*" 2>/dev/null || true
 }
 
-# 寻找可用的 sing-box 二进制文件
-find_singbox() {
-	if command -v sing-box >/dev/null 2>&1; then
-		command -v sing-box
+# ── 查找 usque 二进制文件 ──────────────────────────────────────────────
+find_usque() {
+	if command -v usque >/dev/null 2>&1; then
+		command -v usque
 		return 0
 	fi
-	for path in "/usr/bin/sing-box" "/usr/sbin/sing-box" "/usr/local/bin/sing-box" "/usr/share/singbox/sing-box"; do
+	for path in "$USQUE_BIN_DEFAULT" "/usr/local/bin/usque"; do
 		if [ -x "$path" ]; then
 			echo "$path"
 			return 0
@@ -37,33 +42,11 @@ find_singbox() {
 	return 1
 }
 
-# 检测 sing-box 是否为 1.11/1.12+ 新版本 (新版本使用 endpoints 节点承载 WireGuard)
-is_new_singbox() {
-	local bin="$1"
-	[ -x "$bin" ] || return 1
-	
-	local ver_str=$("$bin" version 2>/dev/null | head -n1 | awk '{print $3}')
-	[ -z "$ver_str" ] && ver_str=$("$bin" version 2>/dev/null | grep -i "version" | awk '{print $3}')
-	[ -z "$ver_str" ] && return 1 # 默认作为老版本处理
-	
-	local main_ver=$(echo "$ver_str" | cut -d. -f1 | tr -cd '0-9')
-	local sub_ver=$(echo "$ver_str" | cut -d. -f2 | tr -cd '0-9')
-	
-	[ -z "$main_ver" ] && main_ver=0
-	[ -z "$sub_ver" ] && sub_ver=0
-	
-	if [ "$main_ver" -gt 1 ]; then
-		return 0
-	elif [ "$main_ver" -eq 1 ] && [ "$sub_ver" -ge 11 ]; then
-		return 0
-	fi
-	return 1
-}
-
+# ── 加载中国 IP 集 ─────────────────────────────────────────────────────
 load_china_ipset() {
 	china_file="/etc/warp/china_ip.txt"
 	[ -s "$china_file" ] || return 1
-	
+
 	tmpf="/tmp/warp-nft-china.$$"
 	{
 		printf 'add set inet %s %s { type ipv4_addr; flags interval; }\n' "$NFT_TABLE" "$CHINA_SET"
@@ -72,30 +55,37 @@ load_china_ipset() {
 		awk '!/^#/ && NF { printf "  %s,\n", $1 }' "$china_file"
 		printf '}\n'
 	} > "$tmpf"
-	
+
 	nft -f "$tmpf"
 	rm -f "$tmpf"
 }
 
+# ── 透明代理 (TPROXY) 设置 ─────────────────────────────────────────────
+# 通过 nftables TPROXY 拦截局域网 TCP 流量,经 ipt2socks 转发到 usque SOCKS5
+# 注意:只拦 IPv4 TCP,不拦 UDP/usque SOCKS5 不支持 UDP relay
+# DNS 防泄露由 dns2socks 独立处理(TCP DNS via SOCKS5)
 setup_tproxy() {
-	socks_port="$1"
-	tproxy_port="$2"
-	bypass_china="$3"
+	local socks_port="$1"
+	local tproxy_port="$2"
+	local bypass_china="$3"
 
-	# 1. 启动 ipt2socks
+	# 1. 启动 ipt2socks (TCP TPROXY → SOCKS5)
 	if [ ! -x "$IPT2SOCKS_BIN" ]; then
 		warp_log "Error: ipt2socks not found at $IPT2SOCKS_BIN"
+		warp_log "Install with: opkg install ipt2socks"
 		return 1
 	fi
 
-	# TPROXY 同时接管 TCP 和 UDP
+	killall -9 ipt2socks 2>/dev/null || true
+
+	# -4 = IPv4 only, -j = concurrency
 	"$IPT2SOCKS_BIN" -s 127.0.0.1 -p "$socks_port" \
 		-b 0.0.0.0 -l "$tproxy_port" \
-		-4 -j 2 -n 65535 </dev/null >>"$LOG_FILE" 2>&1 &
+		-4 -j 2 </dev/null >>"$LOG_FILE" 2>&1 &
 	echo $! > "$IPT2SOCKS_PID"
-	warp_log "Started ipt2socks on port $tproxy_port"
+	warp_log "Started ipt2socks on port $tproxy_port → SOCKS5 $socks_port"
 
-	# 2. 配置 IP 路由规则与本地回环路由
+	# 2. 配置 IP 路由规则与本地回环路由 (IPv4 only)
 	ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 	ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 
@@ -110,12 +100,13 @@ setup_tproxy() {
 	nft add chain inet "$NFT_TABLE" prerouting '{ type filter hook prerouting priority mangle; policy accept; }'
 	nft add chain inet "$NFT_TABLE" output '{ type filter hook output priority mangle; policy accept; }'
 
+	# ── prerouting 链 ──
 	# 绕过本地回环流量
 	nft add rule inet "$NFT_TABLE" prerouting ip saddr 127.0.0.0/8 return
 	# 绕过局域网/内网私有 IP 流量
 	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 224.0.0.0/4 }' return
 
-	# 绕过中国大陆 IP
+	# 绕过中国大陆 IP (直连不走代理)
 	if [ "$bypass_china" = "1" ]; then
 		if load_china_ipset; then
 			nft add rule inet "$NFT_TABLE" prerouting ip daddr @"$CHINA_SET" return
@@ -125,376 +116,339 @@ setup_tproxy() {
 		fi
 	fi
 
-	# TCP 和 UDP TPROXY 规则下发
-	if lsmod | grep -q 'nft_tproxy'; then
-		nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
-		nft add rule inet "$NFT_TABLE" prerouting meta l4proto udp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
-		warp_log "Setup nftables TPROXY routing for TCP and UDP"
-	else
-		warp_log "Warning: kmod-nft-tproxy is missing, TPROXY will not work"
-	fi
+	# 绕过 WARP 自身流量 (防止循环)
+	nft add rule inet "$NFT_TABLE" prerouting ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+
+	# TCP TPROXY 规则 (只拦 IPv4 TCP)
+	nft add rule inet "$NFT_TABLE" prerouting meta l4proto tcp tproxy to :"$tproxy_port" meta mark set "$TPROXY_MARK"
+	warp_log "Setup nftables TPROXY for IPv4 TCP only"
+
+	# ── output 链 (本机产生的流量) ──
+	# 私有 IP + 回环 bypass
+	nft add rule inet "$NFT_TABLE" output ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' return
+	# WARP MASQUE 端点 bypass
+	nft add rule inet "$NFT_TABLE" output ip daddr '{ 162.159.192.0/21, 188.114.96.0/20 }' return
+	# 标记本机 IPv4 TCP 流量走 TPROXY
+	nft add rule inet "$NFT_TABLE" output meta l4proto tcp meta mark set "$TPROXY_MARK"
 }
 
 teardown_tproxy() {
 	if command -v nft >/dev/null 2>&1; then
 		nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
 	fi
-	
+
 	ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" >/dev/null 2>&1 || true
 	ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 || true
-	
+
 	if [ -f "$IPT2SOCKS_PID" ]; then
 		kill "$(cat "$IPT2SOCKS_PID")" >/dev/null 2>&1 || true
 		rm -f "$IPT2SOCKS_PID"
 	fi
-	# 强杀残留进程
 	killall -9 ipt2socks >/dev/null 2>&1 || true
 }
 
+# ── DNS 防泄露 (dns2socks) ────────────────────────────────────────────
+# usque SOCKS5 不支持 UDP relay,TPROXY 不能拦 UDP 53
+# 用 dns2socks 把 DNS 查询转 TCP 通过 SOCKS5 隧道发出,防止 DNS 泄露
+setup_dns_proxy() {
+	local socks_port="$1"
+	local ipv6_enabled="$2"
+	local dns_listen="127.0.0.1"
+	local dns_port="5353"
+	local upstream_dns="9.9.9.9"
+
+	if [ ! -x "$DNS2SOCKS_BIN" ]; then
+		warp_log "Warning: dns2socks not found, DNS leak protection disabled"
+		warp_log "Install with: opkg install dns2socks"
+		return 1
+	fi
+
+	killall -9 dns2socks 2>/dev/null || true
+
+	"$DNS2SOCKS_BIN" 127.0.0.1:"$socks_port" "$upstream_dns:53" "$dns_listen:$dns_port" </dev/null >>"$LOG_FILE" 2>&1 &
+	echo $! > "$DNS2SOCKS_PID"
+	warp_log "Started dns2socks on $dns_listen:$dns_port → SOCKS5 $socks_port → $upstream_dns"
+
+	# 查找 dnsmasq 实际使用的 conf-dir
+	local main_conf
+	main_conf="$(ls /var/etc/dnsmasq.conf.* 2>/dev/null | head -1)"
+	if [ -z "$main_conf" ]; then
+		DNSMASQ_CONF_DIR="/tmp/dnsmasq.d"
+	else
+		local conf_hash
+		conf_hash="$(basename "$main_conf" | sed 's/dnsmasq.conf.//')"
+		DNSMASQ_CONF_DIR="/tmp/dnsmasq.${conf_hash}.d"
+	fi
+	mkdir -p "$DNSMASQ_CONF_DIR" 2>/dev/null
+	WARP_DNS_CONF="$DNSMASQ_CONF_DIR/warp_dns.conf"
+	warp_log "dnsmasq conf-dir: $DNSMASQ_CONF_DIR"
+
+	# 启动 dns2socks 并写入 dnsmasq conf-dir 配置
+	cat > "$WARP_DNS_CONF" <<'DNSCONFIG'
+# Managed by luci-app-warp — DNS leak protection
+no-resolv
+strict-order
+# 默认上游:dns2socks → WARP 隧道
+server=127.0.0.1#5353
+# 大陆域名直连国内 DNS
+server=/cn/223.5.5.5
+server=/com.cn/223.5.5.5
+server=/net.cn/223.5.5.5
+server=/org.cn/223.5.5.5
+server=/taobao.com/223.5.5.5
+server=/tmall.com/223.5.5.5
+server=/alipay.com/223.5.5.5
+server=/alicdn.com/223.5.5.5
+server=/aliyun.com/223.5.5.5
+server=/baidu.com/223.5.5.5
+server=/bdstatic.com/223.5.5.5
+server=/qq.com/119.29.29.29
+server=/tencent.com/119.29.29.29
+server=/weibo.com/223.5.5.5
+server=/sina.com/223.5.5.5
+server=/sinaimg.cn/223.5.5.5
+server=/jd.com/223.5.5.5
+server=/bilibili.com/119.29.29.29
+server=/biligame.com/119.29.29.29
+server=/163.com/223.5.5.5
+server=/126.com/223.5.5.5
+server=/127.net/223.5.5.5
+server=/360.cn/223.5.5.5
+server=/360.com/223.5.5.5
+server=/sohu.com/223.5.5.5
+server=/douyin.com/119.29.29.29
+server=/douyincdn.com/119.29.29.29
+server=/pinduoduo.com/223.5.5.5
+server=/mi.com/223.5.5.5
+server=/xiaomi.com/223.5.5.5
+server=/huawei.com/223.5.5.5
+server=/oppo.com/223.5.5.5
+server=/vivo.com/223.5.5.5
+server=/meituan.com/223.5.5.5
+server=/dianping.com/223.5.5.5
+server=/ctrip.com/223.5.5.5
+server=/12306.cn/223.5.5.5
+server=/zhihu.com/223.5.5.5
+DNSCONFIG
+
+	# 如果 IPv6 未启用,过滤 AAAA 记录
+	if [ "$ipv6_enabled" != "1" ]; then
+		echo "filter-AAAA" >> "$WARP_DNS_CONF"
+		warp_log "IPv6 disabled: filtering AAAA records (TPROXY is IPv4-only)"
+	fi
+
+	# 重启 dnsmasq 加载新配置
+	killall dnsmasq 2>/dev/null || true
+	sleep 1
+	/etc/init.d/dnsmasq start 2>/dev/null &
+	sleep 2
+	warp_log "dnsmasq configured: no-resolv + strict-order, default → WARP tunnel, CN domains → direct"
+}
+
+teardown_dns_proxy() {
+	# 杀掉 dns2socks
+	if [ -f "$DNS2SOCKS_PID" ]; then
+		kill "$(cat "$DNS2SOCKS_PID")" >/dev/null 2>&1 || true
+		rm -f "$DNS2SOCKS_PID"
+	fi
+	killall -9 dns2socks 2>/dev/null || true
+	rm -f "$WARP_DNS_CONF"
+
+	# 写入备选 DNS 配置 (ISP DNS 可能拒绝递归查询)
+	local conf_dir
+	if [ -n "$main_conf" ]; then
+		local conf_hash
+		conf_hash="$(basename "$main_conf" | sed 's/dnsmasq.conf.//')"
+		conf_dir="/tmp/dnsmasq.${conf_hash}.d"
+		local configured_dir
+		configured_dir="$(grep '^conf-dir=' "$main_conf" 2>/dev/null | head -1 | sed 's/conf-dir=//' | sed 's/[[:space:]]*$//')"
+		[ -n "$configured_dir" ] && conf_dir="$configured_dir"
+	else
+		conf_dir="/tmp/dnsmasq.d"
+	fi
+	mkdir -p "$conf_dir" 2>/dev/null
+	cat > "$conf_dir/backup_dns.conf" <<'EOF'
+# Managed by luci-app-warp — fallback DNS (WARP off)
+server=223.5.5.5
+EOF
+
+	# 后台重启 dnsmasq,避免阻塞 rpcd 导致 LuCI XHR 超时
+	(
+		killall dnsmasq 2>/dev/null || true
+		sleep 1
+		mkdir -p /tmp/resolv.conf.d
+		touch /tmp/resolv.conf.d/resolv.conf.auto
+		/etc/init.d/dnsmasq start 2>/dev/null
+		warp_log "DNS leak protection stopped, dnsmasq restored with backup DNS (223.5.5.5)"
+	) &
+}
+
+# ── 构建 usque 命令行参数 ─────────────────────────────────────────────
+build_usque_cmd() {
+	local mode="$1"
+	local usque_bin="$2"
+	local socks_port="$3"
+	local http_port="$4"
+	local mtu="$5"
+
+	case "$mode" in
+		socks)
+			echo "$usque_bin" socks -c "$USQUE_CONF" -b 0.0.0.0 -p "$socks_port"
+			;;
+		http-proxy)
+			echo "$usque_bin" http-proxy -c "$USQUE_CONF" -b 0.0.0.0 -p "$http_port"
+			;;
+		nativetun)
+			echo "$usque_bin" nativetun -c "$USQUE_CONF" --mtu "$mtu"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# ── 主服务启动 ─────────────────────────────────────────────────────────
 start_service() {
 	config_load warp
 	config_get ENABLED config enabled 0
 	[ "$ENABLED" = "1" ] || return 0
 
-	# 1. 查找并验证 sing-box
-	SINGBOX_BIN=$(find_singbox)
-	if [ -z "$SINGBOX_BIN" ]; then
-		warp_log "Missing sing-box binary, service cannot be started."
+	# 1. 查找并验证 usque
+	local USQUE_PATH
+	USQUE_PATH="$(find_usque)"
+	if [ -z "$USQUE_PATH" ]; then
+		warp_log "Missing usque binary, service cannot be started."
+		warp_log "Run 'warp-manager install-usque' to install it."
 		return 1
 	fi
 
 	# 2. 读取配置参数
-	config_get SOCKS_ENABLED config socks_enabled "1"
+	config_get MODE config mode "socks"
 	config_get SOCKS_PORT config socks_port "1080"
-	config_get HTTP_ENABLED config http_enabled "0"
 	config_get HTTP_PORT config http_port "8118"
-	config_get ENDPOINT config endpoint ""
+	config_get HTTP2 config http2 "0"
+	config_get MTU config mtu "1280"
+	config_get IPV6 config ipv6 "0"
+	config_get SNI config sni ""
+	config_get CONNECT_PORT config connect_port "443"
+	config_get ALWAYS_RECONNECT config always_reconnect "1"
+	config_get INSECURE config insecure "0"
+	config_get USERNAME config username ""
+	config_get PASSWORD config password ""
 	config_get GLOBAL_PROXY config global_proxy "0"
 	config_get BYPASS_CHINA config bypass_china "0"
 	config_get TPROXY_PORT config tproxy_port "12345"
-	
-	# 前置代理配置
-	config_get PROXY_ENABLED config proxy_enabled "0"
-	config_get PROXY_TYPE config proxy_type "socks5"
-	config_get PROXY_ADDR config proxy_addr "127.0.0.1"
-	config_get PROXY_PORT config proxy_port "1081"
-	config_get PROXY_UUID config proxy_uuid ""
-	config_get PROXY_PASSWORD config proxy_password ""
-	config_get PROXY_TLS config proxy_tls "0"
-	config_get PROXY_SNI config proxy_sni ""
-	config_get PROXY_VLESS_FLOW config proxy_vless_flow ""
-	config_get PROXY_VMESS_SECURITY config proxy_vmess_security "auto"
-	
-	# 凭据配置
 	config_get PRIVATE_KEY config private_key ""
-	config_get ADDRESS_V6 config address_v6 ""
-	config_get RESERVED config reserved ""
 
 	# 3. 校验账号状态
-	if [ -z "$PRIVATE_KEY" ] || [ -z "$ADDRESS_V6" ]; then
-		warp_log "No registered WARP account configs found. Please run 'warp-manager register' first."
+	if [ -z "$PRIVATE_KEY" ] && [ ! -f "$USQUE_CONF" ]; then
+		warp_log "No WARP account found. Run 'warp-manager register' first."
 		return 1
 	fi
 
-	# 4. 自动安装 jq 以支持安全增量合并
-	if ! command -v jq >/dev/null 2>&1; then
-		warp_log "Installing jq dependency for config manipulation..."
-		opkg update && opkg install jq >/dev/null 2>&1
-	fi
-
-	if ! command -v jq >/dev/null 2>&1; then
-		warp_log "Error: jq is required but could not be installed."
+	if [ ! -f "$USQUE_CONF" ]; then
+		warp_log "config.json not found at $USQUE_CONF. Run 'warp-manager register' first."
 		return 1
 	fi
 
-	# 5. 初始化空白配置文件（如不存在）
+	# 4. 确保数据目录存在
 	mkdir -p "$DATA_DIR"
-	if [ ! -f "$SINGBOX_CONF" ]; then
-		echo '{"log":{"level":"info"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct-out"}],"route":{"rules":[]}}' > "$SINGBOX_CONF"
+
+	# 5. 构建 usque 命令行
+	local base_cmd
+	base_cmd="$(build_usque_cmd "$MODE" "$USQUE_PATH" "$SOCKS_PORT" "$HTTP_PORT" "$MTU")"
+	if [ -z "$base_cmd" ]; then
+		warp_log "Error: Unknown mode '$MODE'"
+		return 1
 	fi
 
-	# 6. 解析优选 endpoint
-	# WireGuard 的 endpoint IP 不能为域名
-	DEFAULT_IP="162.159.193.1"
-	DEFAULT_PORT="2408"
-	EP_IP="$DEFAULT_IP"
-	EP_PORT="$DEFAULT_PORT"
-	
-	if [ -n "$ENDPOINT" ]; then
-		if echo "$ENDPOINT" | grep -q "[a-zA-Z]"; then
-			warp_log "Endpoint '$ENDPOINT' has domain. Resolving domain to IP is not supported natively by sing-box, falling back to default $DEFAULT_IP:$DEFAULT_PORT"
-		else
-			EP_IP=$(echo "$ENDPOINT" | cut -d: -f1)
-			EP_PORT=$(echo "$ENDPOINT" | cut -d: -f2)
-			[ -z "$EP_PORT" ] && EP_PORT="$DEFAULT_PORT"
-		fi
+	# 6. 添加可选标志
+	local cmd_args="$base_cmd"
+
+	# --http2: 使用 HTTP/2 over TCP+TLS 替代 MASQUE/QUIC
+	[ "$HTTP2" = "1" ] && cmd_args="$cmd_args --http2"
+
+	# -6: 使用 IPv6
+	[ "$IPV6" = "1" ] && cmd_args="$cmd_args -6"
+
+	# --insecure: 跳过 TLS 证书验证
+	[ "$INSECURE" = "1" ] && cmd_args="$cmd_args --insecure"
+
+	# --always-reconnect: 自动重连 (默认启用,除非显式设为 0)
+	[ "$ALWAYS_RECONNECT" != "0" ] && cmd_args="$cmd_args --always-reconnect"
+
+	# -s: 自定义 SNI
+	[ -n "$SNI" ] && cmd_args="$cmd_args -s $SNI"
+
+	# -P: MASQUE 连接端口
+	[ -n "$CONNECT_PORT" ] && [ "$CONNECT_PORT" != "443" ] && cmd_args="$cmd_args -P $CONNECT_PORT"
+
+	# -m: MTU (非默认值时添加)
+	[ -n "$MTU" ] && [ "$MTU" != "1280" ] && cmd_args="$cmd_args -m $MTU"
+
+	# -u / -w: SOCKS5 认证 (仅 socks 模式)
+	if [ "$MODE" = "socks" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+		cmd_args="$cmd_args -u $USERNAME -w $PASSWORD"
 	fi
 
-	# 7. 拼接 JSON 格式配置
-	# 构造前置代理 outbound
-	PROXY_OUT_JSON="null"
-	if [ "$PROXY_ENABLED" = "1" ]; then
-		if [ "$PROXY_TYPE" = "socks5" ]; then
-			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "socks", "tag": "proxy-out", "server": $addr, "server_port": $port}')
-		elif [ "$PROXY_TYPE" = "http" ]; then
-			PROXY_OUT_JSON=$(jq -n --arg addr "$PROXY_ADDR" --argjson port "$PROXY_PORT" '{"type": "http", "tag": "proxy-out", "server": $addr, "server_port": $port}')
-		elif [ "$PROXY_TYPE" = "trojan" ]; then
-			PROXY_OUT_JSON=$(jq -n \
-				--arg addr "$PROXY_ADDR" \
-				--argjson port "$PROXY_PORT" \
-				--arg pwd "$PROXY_PASSWORD" \
-				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
-				--arg sni "$PROXY_SNI" \
-				'
-				{
-				  "type": "trojan",
-				  "tag": "proxy-out",
-				  "server": $addr,
-				  "server_port": $port,
-				  "password": $pwd
-				} |
-				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
-				'
-			)
-		elif [ "$PROXY_TYPE" = "vless" ]; then
-			PROXY_OUT_JSON=$(jq -n \
-				--arg addr "$PROXY_ADDR" \
-				--argjson port "$PROXY_PORT" \
-				--arg uuid "$PROXY_UUID" \
-				--arg flow "$PROXY_VLESS_FLOW" \
-				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
-				--arg sni "$PROXY_SNI" \
-				'
-				{
-				  "type": "vless",
-				  "tag": "proxy-out",
-				  "server": $addr,
-				  "server_port": $port,
-				  "uuid": $uuid
-				} |
-				if $flow != "" then . + {"flow": $flow} else . end |
-				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
-				'
-			)
-		elif [ "$PROXY_TYPE" = "vmess" ]; then
-			PROXY_OUT_JSON=$(jq -n \
-				--arg addr "$PROXY_ADDR" \
-				--argjson port "$PROXY_PORT" \
-				--arg uuid "$PROXY_UUID" \
-				--arg sec "$PROXY_VMESS_SECURITY" \
-				--argjson tls_en "$([ "$PROXY_TLS" = "1" ] && echo "true" || echo "false")" \
-				--arg sni "$PROXY_SNI" \
-				'
-				{
-				  "type": "vmess",
-				  "tag": "proxy-out",
-				  "server": $addr,
-				  "server_port": $port,
-				  "uuid": $uuid,
-				  "security": $sec
-				} |
-				if $tls_en then . + {"tls": {"enabled": true, "server_name": $sni}} else . end
-				'
-			)
-		elif [ "$PROXY_TYPE" = "hysteria2" ]; then
-			PROXY_OUT_JSON=$(jq -n \
-				--arg addr "$PROXY_ADDR" \
-				--argjson port "$PROXY_PORT" \
-				--arg pwd "$PROXY_PASSWORD" \
-				--arg sni "$PROXY_SNI" \
-				'
-				{
-				  "type": "hysteria2",
-				  "tag": "proxy-out",
-				  "server": $addr,
-				  "server_port": $port,
-				  "password": $pwd,
-				  "tls": {
-				    "enabled": true,
-				    "server_name": $sni
-				  }
-				}
-				'
-			)
-		elif [ "$PROXY_TYPE" = "tuic" ]; then
-			PROXY_OUT_JSON=$(jq -n \
-				--arg addr "$PROXY_ADDR" \
-				--argjson port "$PROXY_PORT" \
-				--arg uuid "$PROXY_UUID" \
-				--arg pwd "$PROXY_PASSWORD" \
-				--arg sni "$PROXY_SNI" \
-				'
-				{
-				  "type": "tuic",
-				  "tag": "proxy-out",
-				  "server": $addr,
-				  "server_port": $port,
-				  "uuid": $uuid,
-				  "password": $pwd,
-				  "tls": {
-				    "enabled": true,
-				    "server_name": $sni
-				  }
-				}
-				'
-			)
-		fi
-	fi
-
-	# 提取 reserved 数组
-	RESERVED_ARR="null"
-	if echo "$RESERVED" | grep -q "^\[.*\]$"; then
-		RESERVED_ARR="$RESERVED"
-	fi
-
-	# 8. 区分 sing-box 版本生成对应的 WireGuard 块并合并
-	if is_new_singbox "$SINGBOX_BIN"; then
-		warp_log "sing-box version is modern (>= 1.11). Generating configuration with endpoints node."
-		
-		# 构造 1.11+ 的 endpoints 块
-		WG_ENDPOINT_JSON=$(jq -n \
-			--arg ip "$EP_IP" \
-			--argjson port "$EP_PORT" \
-			--arg pk "$PRIVATE_KEY" \
-			--arg v6 "$ADDRESS_V6" \
-			--argjson reserved "$RESERVED_ARR" \
-			--arg proxy_enabled "$PROXY_ENABLED" \
-			'
-			{
-			  "type": "wireguard",
-			  "tag": "warp-out",
-			  "address": ["172.16.0.2/32", ($v6 + "/128")],
-			  "private_key": $pk,
-			  "peers": [
-				{
-				  "address": $ip,
-				  "port": $port,
-				  "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-				  "allowed_ips": ["0.0.0.0/0"]
-				}
-			  ]
-			} | 
-			if $reserved != null then .peers[0] += {"reserved": $reserved} else . end |
-			if $proxy_enabled == "1" then . + {"detour": "proxy-out"} else . end
-			'
-		)
-
-		# 新版本增量写入 endpoints
-		jq \
-			--argjson socks_in "$([ "$SOCKS_ENABLED" = "1" ] && echo "true" || echo "false")" \
-			--argjson socks_port "$SOCKS_PORT" \
-			--argjson http_in "$([ "$HTTP_ENABLED" = "1" ] && echo "true" || echo "false")" \
-			--argjson http_port "$HTTP_PORT" \
-			--argjson proxy_out "$PROXY_OUT_JSON" \
-			--argjson wg_ep "$WG_ENDPOINT_JSON" \
-			'
-			if .inbounds == null then .inbounds = [] else . end |
-			if .outbounds == null then .outbounds = [] else . end |
-			if .endpoints == null then .endpoints = [] else . end |
-			if .route == null then .route = {"rules": []} else . end |
-			if .route.rules == null then .route.rules = [] else . end |
-
-			.inbounds |= map(select(.tag != "socks-in" and .tag != "http-in")) |
-			if $socks_in then .inbounds += [{"type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": $socks_port}] else . end |
-			if $http_in then .inbounds += [{"type": "http", "tag": "http-in", "listen": "0.0.0.0", "listen_port": $http_port}] else . end |
-
-			.outbounds |= map(select(.tag != "warp-out" and .tag != "proxy-out")) |
-			if $proxy_out != null then .outbounds += [$proxy_out] else . end |
-			if (.outbounds | any(.tag == "direct-out") | not) then .outbounds += [{"type": "direct", "tag": "direct-out"}] else . end |
-
-			.endpoints |= map(select(.tag != "warp-out")) |
-			.endpoints += [$wg_ep] |
-
-			.route.rules |= map(select(.inbound | index("socks-in") or index("http-in") | not)) |
-			.route.rules += [{"inbound": ["socks-in", "http-in"], "outbound": "warp-out"}]
-			' \
-			"$SINGBOX_CONF" > /tmp/warp-singbox.tmp && mv /tmp/warp-singbox.tmp "$SINGBOX_CONF"
-			
-	else
-		warp_log "sing-box version is legacy (< 1.11). Generating configuration with outbounds node."
-		
-		# 构造 1.11 以前的 outbounds 块
-		WG_OUTBOUND_JSON=$(jq -n \
-			--arg ip "$EP_IP" \
-			--argjson port "$EP_PORT" \
-			--arg pk "$PRIVATE_KEY" \
-			--arg v6 "$ADDRESS_V6" \
-			--argjson reserved "$RESERVED_ARR" \
-			--arg proxy_enabled "$PROXY_ENABLED" \
-			'
-			{
-			  "type": "wireguard",
-			  "tag": "warp-out",
-			  "server": $ip,
-			  "server_port": $port,
-			  "local_address": ["172.16.0.2/32", ($v6 + "/128")],
-			  "private_key": $pk,
-			  "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-			} | 
-			if $reserved != null then . + {"reserved": $reserved} else . end |
-			if $proxy_enabled == "1" then . + {"detour": "proxy-out"} else . end
-			'
-		)
-
-		# 老版本增量写入 outbounds，清除 endpoints 的残留
-		jq \
-			--argjson socks_in "$([ "$SOCKS_ENABLED" = "1" ] && echo "true" || echo "false")" \
-			--argjson socks_port "$SOCKS_PORT" \
-			--argjson http_in "$([ "$HTTP_ENABLED" = "1" ] && echo "true" || echo "false")" \
-			--argjson http_port "$HTTP_PORT" \
-			--argjson proxy_out "$PROXY_OUT_JSON" \
-			--argjson wg_out "$WG_OUTBOUND_JSON" \
-			'
-			if .inbounds == null then .inbounds = [] else . end |
-			if .outbounds == null then .outbounds = [] else . end |
-			if .route == null then .route = {"rules": []} else . end |
-			if .route.rules == null then .route.rules = [] else . end |
-
-			.inbounds |= map(select(.tag != "socks-in" and .tag != "http-in")) |
-			if $socks_in then .inbounds += [{"type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": $socks_port}] else . end |
-			if $http_in then .inbounds += [{"type": "http", "tag": "http-in", "listen": "0.0.0.0", "listen_port": $http_port}] else . end |
-
-			.outbounds |= map(select(.tag != "warp-out" and .tag != "proxy-out")) |
-			.outbounds += [$wg_out] |
-			if $proxy_out != null then .outbounds += [$proxy_out] else . end |
-			if (.outbounds | any(.tag == "direct-out") | not) then .outbounds += [{"type": "direct", "tag": "direct-out"}] else . end |
-
-			if .endpoints != null then .endpoints |= map(select(.tag != "warp-out")) else . end |
-
-			.route.rules |= map(select(.inbound | index("socks-in") or index("http-in") | not)) |
-			.route.rules += [{"inbound": ["socks-in", "http-in"], "outbound": "warp-out"}]
-			' \
-			"$SINGBOX_CONF" > /tmp/warp-singbox.tmp && mv /tmp/warp-singbox.tmp "$SINGBOX_CONF"
-	fi
-
-	# 9. 通过 procd 启动 sing-box 服务
+	# 7. 通过 procd 启动 usque
 	procd_open_instance "warp"
-	procd_set_param command "$SINGBOX_BIN" run -c "$SINGBOX_CONF"
+	# shellcheck disable=SC2086
+	procd_set_param command $cmd_args
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param term_timeout 5
+	procd_set_param term_timeout 2
 	procd_close_instance
 
-	warp_log "Started sing-box warp proxy"
+	local mode_desc
+	case "$MODE" in
+		socks)      mode_desc="SOCKS5 proxy on port $SOCKS_PORT" ;;
+		http-proxy) mode_desc="HTTP proxy on port $HTTP_PORT" ;;
+		nativetun)  mode_desc="TUN device mode (MTU $MTU)" ;;
+	esac
+	warp_log "Started usque in $MODE mode ($mode_desc)"
 
-	# 10. 处理全局透明代理接管 (TPROXY)
+	# 8. 处理全局透明代理接管 (TPROXY) + DNS 防泄露
+	# socks 和 http-proxy 模式: 通过 nftables TPROXY + ipt2socks 接管 TCP 流量
+	# DNS 防泄露: dns2socks 把 DNS 查询通过 SOCKS5 隧道发出
+	# nativetun 模式: usque 自己创建 TUN 设备,不需要 TPROXY
 	if [ "$GLOBAL_PROXY" = "1" ]; then
-		if [ "$SOCKS_ENABLED" = "1" ]; then
-			# 延迟启动透明拦截，确保 sing-box 端口就绪
-			(sleep 3; setup_tproxy "$SOCKS_PORT" "$TPROXY_PORT" "$BYPASS_CHINA") &
-		else
-			warp_log "Warning: Global proxy mode requires SOCKS5 proxy to be enabled."
+		if [ "$MODE" = "socks" ] || [ "$MODE" = "http-proxy" ]; then
+			# 延迟启动透明拦截,确保 usque 端口就绪
+			(sleep 3; setup_tproxy "$SOCKS_PORT" "$TPROXY_PORT" "$BYPASS_CHINA"; setup_dns_proxy "$SOCKS_PORT" "$IPV6") &
+			warp_log "Global TPROXY + DNS leak protection enabled ($MODE mode)"
+		elif [ "$MODE" = "nativetun" ]; then
+			warp_log "nativetun mode: TPROXY not needed (usque creates TUN device)"
 		fi
 	fi
 }
 
 stop_service() {
-	teardown_tproxy
-	warp_log "Service stopped"
+	# 杀掉 usque 子进程 (procd 会自动等 term_timeout 后 SIGKILL)
+	# 把清理操作放到后台子shell,避免阻塞 procd 导致 LuCI XHR 超时
+	(
+		teardown_tproxy
+		teardown_dns_proxy
+		warp_log "Service stopped"
+	) &
 }
 
 reload_service() {
-	stop_service
-	start_service
+	# 快速同步清理 (不等 sleep,直接杀进程+删表)
+	killall -9 usque ipt2socks dns2socks 2>/dev/null || true
+	nft delete table inet luci_warp >/dev/null 2>&1 || true
+	ip rule del fwmark 0x2333 table 100 >/dev/null 2>&1 || true
+	ip route del local 0.0.0.0/0 dev lo table 100 >/dev/null 2>&1 || true
+	# 删除备份 DNS 配置
+	rm -f /tmp/dnsmasq.cfg01411c.d/backup_dns.conf /tmp/dnsmasq.d/backup_dns.conf 2>/dev/null || true
+	killall dnsmasq 2>/dev/null || true
+	# 后台恢复 dnsmasq + 启动 WARP
+	(
+		sleep 1
+		mkdir -p /tmp/resolv.conf.d
+		touch /tmp/resolv.conf.d/resolv.conf.auto
+		/etc/init.d/dnsmasq start 2>/dev/null
+		start_service
+	) &
 }

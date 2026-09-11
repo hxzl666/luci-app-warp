@@ -18,7 +18,7 @@ return view.extend({
         return Promise.all([
             uci.load('warp'),
             L.resolveDefault(callServiceList('warp'), {}),
-            L.resolveDefault(fs.stat('/etc/warp/reg.json'), null),
+            L.resolveDefault(fs.stat('/etc/warp/config.json'), null),
             L.resolveDefault(fs.exec('/bin/netstat', ['-tln']), { stdout: '' })
         ]);
     },
@@ -26,7 +26,7 @@ return view.extend({
     pollStatus: function () {
         return Promise.all([
             L.resolveDefault(callServiceList('warp'), {}),
-            L.resolveDefault(fs.stat('/etc/warp/reg.json'), null),
+            L.resolveDefault(fs.stat('/etc/warp/config.json'), null),
             L.resolveDefault(fs.exec('/bin/netstat', ['-tln']), { stdout: '' })
         ]).then(L.bind(function (data) {
             this.updateStatusDisplay(data);
@@ -54,14 +54,22 @@ return view.extend({
         var netstatOutput = data[2].stdout || '';
 
         var isRunning = this.serviceIsRunning(serviceData);
+        var mode = uci.get('warp', 'config', 'mode') || 'socks';
         var socksPort = uci.get('warp', 'config', 'socks_port') || '1080';
         var httpPort = uci.get('warp', 'config', 'http_port') || '8118';
-        
+
         var socksRunning = netstatOutput.indexOf(':' + socksPort) !== -1;
         var httpRunning = netstatOutput.indexOf(':' + httpPort) !== -1;
 
-        // 更新状态显示
+        var modeNames = {
+            'socks': 'SOCKS5 代理',
+            'http-proxy': 'HTTP 代理',
+            'nativetun': '原生隧道'
+        };
+        var modeDisplay = modeNames[mode] || mode;
+
         var statusEl = document.getElementById('warp-status');
+        var modeEl = document.getElementById('warp-mode');
         var accountEl = document.getElementById('warp-account');
         var socksEl = document.getElementById('warp-socks');
         var httpEl = document.getElementById('warp-http');
@@ -70,6 +78,10 @@ return view.extend({
             statusEl.innerHTML = isRunning
                 ? '<span class="badge success">运行中</span>'
                 : '<span class="badge error">已停止</span>';
+        }
+
+        if (modeEl) {
+            modeEl.innerHTML = '<span class="badge info">' + modeDisplay + '</span>';
         }
 
         if (accountEl) {
@@ -83,7 +95,7 @@ return view.extend({
                 ? '<span class="badge success">运行中 (端口 ' + socksPort + ')</span>'
                 : '<span class="badge warning">未启动</span>';
         }
-        
+
         if (httpEl) {
             httpEl.innerHTML = httpRunning
                 ? '<span class="badge success">运行中 (端口 ' + httpPort + ')</span>'
@@ -147,7 +159,6 @@ return view.extend({
 
                 var cleanVal = function(match) {
                     if (!match) return null;
-                    // 清理 ANSI 终端着色代码并去除两端空白
                     return match[1].replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
                 };
 
@@ -197,14 +208,19 @@ return view.extend({
         var netstatOutput = data[3].stdout || '';
 
         var isRunning = this.serviceIsRunning(serviceData);
+        var mode = uci.get('warp', 'config', 'mode') || 'socks';
         var socksPort = uci.get('warp', 'config', 'socks_port') || '1080';
         var httpPort = uci.get('warp', 'config', 'http_port') || '8118';
-        
+
         var socksRunning = netstatOutput.indexOf(':' + socksPort) !== -1;
         var httpRunning = netstatOutput.indexOf(':' + httpPort) !== -1;
 
-        var ipv4 = uci.get('warp', 'config', 'address_v4') || '-';
-        var ipv6 = uci.get('warp', 'config', 'address_v6') || '-';
+        var modeNames = {
+            'socks': 'SOCKS5 代理',
+            'http-proxy': 'HTTP 代理',
+            'nativetun': '原生隧道'
+        };
+        var modeDisplay = modeNames[mode] || mode;
 
         poll.add(L.bind(this.pollStatus, this), 5);
 
@@ -222,13 +238,14 @@ return view.extend({
                 '.badge.success { background: #d4edda; color: #155724; }',
                 '.badge.error { background: #f8d7da; color: #721c24; }',
                 '.badge.warning { background: #fff3cd; color: #856404; }',
+                '.badge.info { background: #d1ecf1; color: #0c5460; }',
                 '.action-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }',
                 '.action-buttons .btn { padding: 10px 20px; }'
             ].join('\n')),
 
             E('div', { 'class': 'warp-header' }, [
-                E('h2', {}, 'Cloudflare WARP'),
-                E('p', {}, _('加密您的网络流量，提供更快、更安全的互联网访问'))
+                E('h2', {}, 'Cloudflare WARP (MASQUE)'),
+                E('p', {}, _('通过 usque MASQUE 协议加密您的网络流量，提供更快、更安全的互联网访问'))
             ]),
 
             E('div', { 'class': 'status-grid' }, [
@@ -239,6 +256,11 @@ return view.extend({
                         E('span', { 'id': 'warp-status' },
                             isRunning ? E('span', { 'class': 'badge success' }, _('运行中'))
                                 : E('span', { 'class': 'badge error' }, _('已停止')))
+                    ]),
+                    E('div', { 'class': 'status-row' }, [
+                        E('span', {}, _('MASQUE 模式')),
+                        E('span', { 'id': 'warp-mode' },
+                            E('span', { 'class': 'badge info' }, modeDisplay))
                     ])
                 ]),
 
@@ -249,14 +271,6 @@ return view.extend({
                         E('span', { 'id': 'warp-account' },
                             accountExists ? E('span', { 'class': 'badge success' }, _('已注册'))
                                 : E('span', { 'class': 'badge warning' }, _('未注册')))
-                    ]),
-                    E('div', { 'class': 'status-row' }, [
-                        E('span', {}, 'IPv4'),
-                        E('span', {}, ipv4)
-                    ]),
-                    E('div', { 'class': 'status-row' }, [
-                        E('span', {}, 'IPv6'),
-                        E('span', { 'style': 'font-size: 11px;' }, ipv6)
                     ])
                 ]),
 

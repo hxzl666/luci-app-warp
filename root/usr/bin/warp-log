@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 LOG_FILE="/var/log/warp.log"
-PATTERN="warp|ipt2socks"
+PATTERN="warp|usque"
 LINES="${1:-200}"
 
 case "$LINES" in

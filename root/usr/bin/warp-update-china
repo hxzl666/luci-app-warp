@@ -33,8 +33,8 @@ download_china_list() {
 apply_china_routes() {
 	BYPASS_CHINA="$(uci -q get warp.config.bypass_china)"
 	[ "$BYPASS_CHINA" = "1" ] || return 0
-	
-	warp_log "Applying updated China IP list via nftables set..."
+
+	warp_log "Applying updated China IP list..."
 	/etc/init.d/warp restart >/dev/null 2>&1
 }
 

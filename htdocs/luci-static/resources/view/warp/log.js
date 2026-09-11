@@ -16,7 +16,7 @@ return view.extend({
 
     render: function(data) {
         var logData = data || _('No log data available');
-        
+
         var logTextarea = E('textarea', {
             'id': 'syslog',
             'class': 'cbi-input-textarea',
@@ -51,7 +51,7 @@ return view.extend({
             E('h2', {}, _('WARP 日志')),
             E('div', { 'class': 'cbi-section' }, [
                 E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;' }, [
-                    E('span', {}, _('WARP 服务运行日志')),
+                    E('span', {}, _('WARP 服务运行日志 (usque MASQUE)')),
                     E('div', { 'style': 'display: flex; gap: 15px; align-items: center;' }, [
                         E('label', { 'style': 'display: flex; align-items: center; gap: 5px;' }, [
                             autoRefreshCheckbox,
